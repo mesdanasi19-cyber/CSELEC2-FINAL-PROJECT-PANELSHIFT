@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'services/comic_parser_service.dart';
+import 'screens/comic_reader_screen.dart';
 
 void main() {
   runApp(const PanelShiftApp());
@@ -70,6 +71,16 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
         _extractedPageCount = pages.length;
         _statusMessage = 'Successfully extracted $_extractedPageCount pages from archive!';
       });
+
+      if (!mounted) return;
+
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => ComicReaderScreen(pageBytes: pages),
+        ),
+      );
+
     } catch (e) {
       setState(() {
         _statusMessage = 'Error unpacking archive: $e';
