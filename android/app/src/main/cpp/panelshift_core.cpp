@@ -20,12 +20,14 @@ Java_com_panelshift_engine_PanelShiftNativeBridge_detectDocumentCorners(
     return 1;
 }
 
+// Updated to detect multiple comic panes using contour analysis and adaptive threshholding
 __attribute__((visibility("default"))) __attribute__((used))
-int process_document_edge_detection(
+int process_comic_panels(
         uint8_t* pixel_data,
         int width,
         int height,
-        float* out_corners
+        float* out_rects,     // Output buffer for normalized panel coordinates [x, y, w, h, ...]
+        int max_panels        // Maximum capacity of the output array
 ) {
     if (pixel_data == nullptr || width <= 0 || height <= 0) {
         LOGE("Invalid image buffer passed to native core.");
@@ -39,77 +41,50 @@ int process_document_edge_detection(
     cv::Mat gray_frame;
     cv::cvtColor(input_frame, gray_frame, cv::COLOR_RGBA2GRAY);
 
-    // Step 3: Apply Gaussian Blur
-    cv::Mat blurred_frame;
-    cv::GaussianBlur(gray_frame, blurred_frame, cv::Size(5, 5), 0);
+    // Step 3: Apply Adaptive Thresholding to isolate black gutters and panel borders cleanly from white backgrounds
+    cv::Mat thresh_frame;
+    cv::adaptiveThreshold(gray_frame, thresh_frame, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+                          cv::THRESH_BINARY_INV, 11, 2);
 
-    // Step 4: Apply Canny Edge Detection
-    cv::Mat edges_frame;
-    cv::Canny(blurred_frame, edges_frame, 75, 200);
-
-    // Step 5: Find contours using core OpenCV function
+    // Step 4: Find contours of panels
     std::vector<std::vector<cv::Point>> contours;
     std::vector<cv::Vec4i> hierarchy;
-    cv::findContours(edges_frame, contours, hierarchy, cv::RETR_LIST, cv::CHAIN_APPROX_SIMPLE);
+    cv::findContours(thresh_frame, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
     if (contours.empty()) {
-        LOGI("No contours detected in frame.");
+        LOGI("No panel contours detected in frame.");
         return 0;
     }
 
-    // Step 6: Evaluate contours using pure C++ math (Shoelace formula & manual bounds)
-    double max_area = 0.0;
-    std::vector<cv::Point> best_contour;
+    int panel_count = 0;
+    double total_area = static_cast<double>(width * height);
 
     for (const auto& contour : contours) {
-        double area = 0.0;
-        int n = contour.size();
-        if (n < 4) continue;
+        if (panel_count >= max_panels) break;
 
-        for (int i = 0; i < n; ++i) {
-            int j = (i + 1) % n;
-            area += static_cast<double>(contour[i].x) * contour[j].y;
-            area -= static_cast<double>(contour[j].x) * contour[i].y;
-        }
-        area = std::abs(area) / 2.0;
+        // Approximate contour to a polygon to check if it's roughly rectangular
+        std::vector<cv::Point> approx;
+        double peri = cv::arcLength(contour, true);
+        cv::approxPolyDP(contour, approx, 0.02 * peri, true);
 
-        // Filter out tiny noise contours (10% of total frame area)
-        if (area > (width * height * 0.10) && area > max_area) {
-            int min_x = contour[0].x, max_x = contour[0].x;
-            int min_y = contour[0].y, max_y = contour[0].y;
+        double area = cv::contourArea(contour);
 
-            for (const auto& pt : contour) {
-                if (pt.x < min_x) min_x = pt.x;
-                if (pt.x > max_x) max_x = pt.x;
-                if (pt.y < min_y) min_y = pt.y;
-                if (pt.y > max_y) max_y = pt.y;
-            }
+        // Filter out tiny artifacts or oversized page borders (panels must be between 1% and 85% of page area)
+        if (area > (total_area * 0.01) && area < (total_area * 0.85) && approx.size() >= 4 && approx.size() <= 6) {
+            cv::Rect rect = cv::boundingRect(approx);
 
-            std::vector<cv::Point> quad = {
-                    cv::Point(min_x, min_y),
-                    cv::Point(max_x, min_y),
-                    cv::Point(max_x, max_y),
-                    cv::Point(min_x, max_y)
-            };
+            // Write normalized coordinates (x, y, w, h scaled 0.0 to 1.0)
+            out_rects[panel_count * 4 + 0] = static_cast<float>(rect.x) / static_cast<float>(width);
+            out_rects[panel_count * 4 + 1] = static_cast<float>(rect.y) / static_cast<float>(height);
+            out_rects[panel_count * 4 + 2] = static_cast<float>(rect.width) / static_cast<float>(width);
+            out_rects[panel_count * 4 + 3] = static_cast<float>(rect.height) / static_cast<float>(height);
 
-            max_area = area;
-            best_contour = quad;
+            panel_count++;
         }
     }
-
-    if (best_contour.size() != 4) {
-        LOGI("Valid document quadrilateral not found.");
-        return 0;
-    }
-
-    // Step 7: Write normalized coordinates (0.0 to 1.0) for Flutter consumption
-    for (int i = 0; i < 4; ++i) {
-        out_corners[i * 2]     = static_cast<float>(best_contour[i].x) / static_cast<float>(width);
-        out_corners[i * 2 + 1] = static_cast<float>(best_contour[i].y) / static_cast<float>(height);
-    }
-
-    LOGI("Successfully extracted document corners with area: %f", max_area);
-    return 1;
+    //updated to display panel cound instead of max area of a single panel
+    LOGI("Successfully extracted %d comic panels.", panel_count);
+    return panel_count;
 }
 
 } // extern "C"
