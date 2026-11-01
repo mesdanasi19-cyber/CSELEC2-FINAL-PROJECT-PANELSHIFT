@@ -142,7 +142,7 @@ int process_comic_panels(
     }
 
     std::vector<int> indices;
-    cv::dnn::NMSBoxes(boxes, confidences, 0.35f, 0.45f, indices); // Slightly lowered confidence threshold to catch more panels
+    cv::dnn::NMSBoxes(boxes, confidences, 0.35f, 0.45f, indices);
 
     struct PanelBox {
         int id;
@@ -155,14 +155,19 @@ int process_comic_panels(
     for (int idx : indices) {
         const auto& rect = boxes[idx];
 
-        // 1. RELAXED SIZE & DIMENSION FILTERS (Allows smaller panels)
-        if (rect.width < 25 || rect.height < 25) continue;
-        int area = rect.width * rect.height;
-        if (area < 600) continue; // Lowered area floor significantly
-
-        // 2. Aspect Ratio Filter
         float aspect_ratio = static_cast<float>(rect.width) / static_cast<float>(rect.height);
-        if (aspect_ratio < 0.15f || aspect_ratio > 6.0f) continue;
+
+        // ADAPTIVE SIZING: Allow shorter heights specifically for wide cinematic/landscape panels
+        int min_height = (aspect_ratio > 2.0f) ? 15 : 25;
+        int min_width = 25;
+
+        if (rect.width < min_width || rect.height < min_height) continue;
+
+        int area = rect.width * rect.height;
+        if (area < 350) continue; // Lowered area floor to catch smaller panels
+
+        // Aspect ratio bounds (supports wide strips up to 8.0 ratio)
+        if (aspect_ratio < 0.15f || aspect_ratio > 8.0f) continue;
 
         cv::Rect safe_rect = rect & cv::Rect(0, 0, rgb_frame.cols, rgb_frame.rows);
         if (safe_rect.width <= 0 || safe_rect.height <= 0) continue;
@@ -175,12 +180,12 @@ int process_comic_panels(
         cv::Scalar mean, stddev;
         cv::meanStdDev(gray_crop, mean, stddev);
 
-        if (stddev[0] < 15.0) continue; // Slightly adjusted stddev threshold
+        if (stddev[0] < 15.0) continue;
 
         candidate_boxes.push_back({id_counter++, safe_rect});
     }
 
-    // 3. Merging loop for overlapping fragments
+    // Merging loop for overlapping fragments
     std::vector<PanelBox> merged_boxes;
     for (const auto& box_item : candidate_boxes) {
         bool merged = false;
@@ -202,16 +207,23 @@ int process_comic_panels(
         }
     }
 
-    // 4. CRITICAL FIX: Re-sort final merged boxes strictly Top-to-Bottom, Left-to-Right
+    // DYNAMIC FALLBACK FOR COVERS & RECAP PAGES:
+    // If a page has zero valid panels detected (e.g. cover art, splash pages, or text-heavy recap pages),
+    // treat the entire image as a single full-page panel instead of leaving it empty.
+    if (merged_boxes.empty()) {
+        merged_boxes.push_back({1, cv::Rect(0, 0, width, height)});
+    }
+
+    // Re-sort final merged boxes strictly Top-to-Bottom, Left-to-Right
     std::sort(merged_boxes.begin(), merged_boxes.end(), [](const PanelBox& a, const PanelBox& b) {
-        const int row_tolerance = 45; // Grouping tolerance for same-row panels
+        const int row_tolerance = 45;
         if (std::abs(a.rect.y - b.rect.y) > row_tolerance) {
-            return a.rect.y < b.rect.y; // Top to bottom
+            return a.rect.y < b.rect.y;
         }
-        return a.rect.x < b.rect.x;     // Left to right within the same row
+        return a.rect.x < b.rect.x;
     });
 
-    // 5. Populate final output array
+    // Populate final output array
     int panel_count = 0;
     for (const auto& item : merged_boxes) {
         if (panel_count >= max_panels) break;

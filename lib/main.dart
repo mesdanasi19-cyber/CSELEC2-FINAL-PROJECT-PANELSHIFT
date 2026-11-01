@@ -153,19 +153,50 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
 /// ==========================================
 class ComicPanelPainter extends CustomPainter {
   final List<ComicPanel> panels;
+  final int activeIndex;
+  final bool showDimming;
 
-  ComicPanelPainter({required this.panels});
+  ComicPanelPainter({
+    required this.panels,
+    required this.activeIndex,
+    this.showDimming = true,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
+    if (panels.isEmpty) return;
+
+    // 1. Draw Spotlight Dimming (dim everything EXCEPT the active panel)
+    if (showDimming && activeIndex >= 0 && activeIndex < panels.length) {
+      final activePanel = panels[activeIndex];
+      final activeRect = Rect.fromLTWH(
+        activePanel.x * size.width,
+        activePanel.y * size.height,
+        activePanel.width * size.width,
+        activePanel.height * size.height,
+      );
+
+      final dimPaint = Paint()
+        ..color = Colors.black.withOpacity(0.65)
+        ..style = PaintingStyle.fill;
+
+      // Save canvas state and punch out active panel rectangle
+      canvas.saveLayer(Offset.zero & size, Paint());
+      canvas.drawRect(Offset.zero & size, dimPaint);
+      canvas.drawRect(activeRect, Paint()..blendMode = BlendMode.clear);
+      canvas.restore();
+    }
+
+    // 2. Draw Bounding Boxes and Indicators
     final strokePaint = Paint()
       ..color = Colors.yellowAccent
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 4.0;
+      ..strokeWidth = 3.0;
 
-    final fillPaint = Paint()
-      ..color = Colors.yellowAccent.withOpacity(0.08)
-      ..style = PaintingStyle.fill;
+    final activeStrokePaint = Paint()
+      ..color = Colors.cyanAccent
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 4.5;
 
     for (int i = 0; i < panels.length; i++) {
       final panel = panels[i];
@@ -176,31 +207,34 @@ class ComicPanelPainter extends CustomPainter {
         panel.height * size.height,
       );
 
-      canvas.drawRect(rect, fillPaint);
-      canvas.drawRect(rect, strokePaint);
+      final isCurrent = (i == activeIndex);
+      canvas.drawRect(rect, isCurrent ? activeStrokePaint : strokePaint);
 
+      // Label badge
       final textSpan = TextSpan(
         text: ' #${i + 1} ',
-        style: const TextStyle(
+        style: TextStyle(
           color: Colors.black,
-          fontSize: 15,
+          fontSize: 14,
           fontWeight: FontWeight.bold,
-          backgroundColor: Colors.yellowAccent,
+          backgroundColor: isCurrent ? Colors.cyanAccent : Colors.yellowAccent,
         ),
       );
 
       final textPainter = TextPainter(
         text: textSpan,
         textDirection: TextDirection.ltr,
-      );
-      textPainter.layout();
-      textPainter.paint(canvas, Offset(rect.left + 6, rect.top + 6));
+      )..layout();
+
+      textPainter.paint(canvas, Offset(rect.left + 4, rect.top + 4));
     }
   }
 
   @override
   bool shouldRepaint(covariant ComicPanelPainter oldDelegate) {
-    return oldDelegate.panels != panels;
+    return oldDelegate.panels != panels ||
+        oldDelegate.activeIndex != activeIndex ||
+        oldDelegate.showDimming != showDimming;
   }
 }
 
@@ -229,6 +263,8 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
   bool _isAnalyzing = false;
   bool _isEngineReady = false;
   bool _showPanelOverlays = true;
+  bool _showUI = true; // Toggle for center tap header visibility
+  Size? _lastViewportSize;
 
   @override
   void initState() {
@@ -275,18 +311,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
   }
 
   Future<void> _processPagePanels(int index, Uint8List compressedBytes) async {
-    if (_detectedPanelsCache.containsKey(index) || _isAnalyzing || !_isEngineReady) return;
-
-    if (index == 0) {
-      setState(() {
-        _detectedPanelsCache[0] = [
-          const ComicPanel(x: 0.0, y: 0.0, width: 1.0, height: 1.0)
-        ];
-      });
-      return;
-    }
-
-    setState(() => _isAnalyzing = true);
+    if (_detectedPanelsCache.containsKey(index) || (_isAnalyzing && _currentPage == index) || !_isEngineReady) return;
 
     try {
       final ui.Codec codec = await ui.instantiateImageCodec(compressedBytes);
@@ -295,14 +320,23 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
 
       final int width = image.width;
       final int height = image.height;
-
       _imageSizesCache[index] = Size(width.toDouble(), height.toDouble());
+
+      if (index == 0) {
+        setState(() {
+          _detectedPanelsCache[0] = [
+            const ComicPanel(x: 0.0, y: 0.0, width: 1.0, height: 1.0)
+          ];
+        });
+        return;
+      }
+
+      setState(() => _isAnalyzing = true);
 
       final ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
       if (byteData == null) return;
 
       final Uint8List rawRgbaBytes = byteData.buffer.asUint8List();
-
       final panels = NativeOpenCvService.detectPanels(rawRgbaBytes, width, height);
       debugPrint('Page $index: Extracted ${panels.length} panels (Resolution: ${width}x$height)');
 
@@ -310,6 +344,14 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
       setState(() {
         _detectedPanelsCache[index] = panels;
       });
+
+      if (index == _currentPage && panels.isNotEmpty && _lastViewportSize != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && _currentPage == index) {
+            _focusOnPanel(panels[_currentPanelIndex], _lastViewportSize!);
+          }
+        });
+      }
     } catch (e) {
       debugPrint('Error running OpenCV panel detection on page $index: $e');
     } finally {
@@ -317,9 +359,10 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
     }
   }
 
-  void _onPageChanged(int index) {
-    setState(() => _currentPage = index);
-    _processPagePanels(index, widget.pageBytes[index]);
+  void _resetZoomInstant() {
+    _animationController.stop();
+    _zoomAnimation = null;
+    _transformationController.value = Matrix4.identity();
   }
 
   void _focusOnPanel(ComicPanel panel, Size viewportSize) {
@@ -333,22 +376,27 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
     final double imgW = imgSize.width;
     final double imgH = imgSize.height;
 
-    final double scaleX = containerW / imgW;
-    final double scaleY = containerH / imgH;
-    final double fitScale = scaleX < scaleY ? scaleX : scaleY;
+    final double fitScale = (containerW / imgW < containerH / imgH)
+        ? containerW / imgW
+        : containerH / imgH;
 
     final double renderedW = imgW * fitScale;
     final double renderedH = imgH * fitScale;
-
     final double offsetX = (containerW - renderedW) / 2.0;
     final double offsetY = (containerH - renderedH) / 2.0;
 
-    final double panelScreenX = offsetX + (panel.x * imgW * fitScale);
-    final double panelScreenY = offsetY + (panel.y * imgH * fitScale);
-    final double panelScreenW = panel.width * imgW * fitScale;
-    final double panelScreenH = panel.height * imgH * fitScale;
+    final double panelScreenX = offsetX + (panel.x * renderedW);
+    final double panelScreenY = offsetY + (panel.y * renderedH);
+    final double panelScreenW = panel.width * renderedW;
+    final double panelScreenH = panel.height * renderedH;
 
-    const double targetScale = 2.2;
+    // Zero-margin edge-to-edge scaling calculation (no 0.94 padding shrink)
+    final double scaleX = containerW / panelScreenW;
+    final double scaleY = containerH / panelScreenH;
+
+    double targetScale = (scaleX < scaleY ? scaleX : scaleY);
+    targetScale = targetScale.clamp(1.0, 5.0);
+
     final double panelCenterX = panelScreenX + (panelScreenW / 2.0);
     final double panelCenterY = panelScreenY + (panelScreenH / 2.0);
 
@@ -369,26 +417,91 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
 
   void _nextPanel(Size viewportSize) {
     final panels = _detectedPanelsCache[_currentPage] ?? [];
-    if (panels.isEmpty) return;
 
-    setState(() {
-      if (_currentPanelIndex < panels.length - 1) {
-        _currentPanelIndex++;
-      } else {
-        if (_currentPage < widget.pageBytes.length - 1) {
+    if (panels.isEmpty) {
+      if (_currentPage < widget.pageBytes.length - 1) {
+        _resetZoomInstant();
+        setState(() {
           _currentPage++;
           _currentPanelIndex = 0;
-          _pageController.animateToPage(
-            _currentPage,
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeInOut,
-          );
-        }
+        });
+        _pageController.animateToPage(
+          _currentPage,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeInOut,
+        );
       }
-    });
+      return;
+    }
 
-    if (panels.isNotEmpty) {
+    if (_currentPanelIndex < panels.length - 1) {
+      setState(() => _currentPanelIndex++);
       _focusOnPanel(panels[_currentPanelIndex], viewportSize);
+    } else {
+      if (_currentPage < widget.pageBytes.length - 1) {
+        _resetZoomInstant();
+        setState(() {
+          _currentPage++;
+          _currentPanelIndex = 0;
+        });
+        _pageController.animateToPage(
+          _currentPage,
+          duration: const Duration(milliseconds: 350),
+          curve: Curves.easeInOut,
+        ).then((_) {
+          final newPanels = _detectedPanelsCache[_currentPage] ?? [];
+          if (newPanels.isNotEmpty) {
+            _focusOnPanel(newPanels[0], viewportSize);
+          }
+        });
+      }
+    }
+  }
+
+  void _prevPanel(Size viewportSize) {
+    final panels = _detectedPanelsCache[_currentPage] ?? [];
+
+    if (_currentPanelIndex > 0) {
+      setState(() => _currentPanelIndex--);
+      _focusOnPanel(panels[_currentPanelIndex], viewportSize);
+    } else {
+      if (_currentPage > 0) {
+        _resetZoomInstant();
+        setState(() {
+          _currentPage--;
+        });
+        final prevPanels = _detectedPanelsCache[_currentPage] ?? [];
+        setState(() {
+          _currentPanelIndex = prevPanels.isNotEmpty ? prevPanels.length - 1 : 0;
+        });
+        _pageController.animateToPage(
+          _currentPage,
+          duration: const Duration(milliseconds: 350),
+          curve: Curves.easeInOut,
+        ).then((_) {
+          final loadedPrevPanels = _detectedPanelsCache[_currentPage] ?? [];
+          if (loadedPrevPanels.isNotEmpty) {
+            _focusOnPanel(loadedPrevPanels[_currentPanelIndex], viewportSize);
+          }
+        });
+      }
+    }
+  }
+
+  void _handleScreenTap(TapUpDetails details, Size viewportSize) {
+    final double screenWidth = viewportSize.width;
+    final double tapX = details.localPosition.dx;
+
+    // Divide screen into 3 touch zones: Left (30%), Center (40%), Right (30%)
+    if (tapX < screenWidth * 0.3) {
+      _prevPanel(viewportSize);
+    } else if (tapX > screenWidth * 0.7) {
+      _nextPanel(viewportSize);
+    } else {
+      // Center tap: Toggle header UI visibility
+      setState(() {
+        _showUI = !_showUI;
+      });
     }
   }
 
@@ -396,7 +509,8 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(
+      appBar: _showUI
+          ? AppBar(
         backgroundColor: Colors.black.withOpacity(0.8),
         title: Text(
           'PanelShift Reader (${_currentPage + 1}/${widget.pageBytes.length})',
@@ -414,78 +528,65 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
             },
           ),
         ],
-      ),
-      body: !_isEngineReady
-          ? const Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 16),
-            Text('Initializing YOLO Engine...'),
-          ],
-        ),
       )
+          : null,
+      body: !_isEngineReady
+          ? const Center(child: CircularProgressIndicator())
           : LayoutBuilder(
         builder: (context, constraints) {
-          return PageView.builder(
-            controller: _pageController,
-            itemCount: widget.pageBytes.length,
-            onPageChanged: _onPageChanged,
-            itemBuilder: (context, index) {
-              final panels = _detectedPanelsCache[index] ?? [];
-              final imgSize = _imageSizesCache[index];
+          _lastViewportSize = constraints.biggest;
+          return GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapUp: (details) => _handleScreenTap(details, constraints.biggest),
+            child: PageView.builder(
+              controller: _pageController,
+              physics: const NeverScrollableScrollPhysics(), // Managed via 3-zone taps
+              itemCount: widget.pageBytes.length,
+              onPageChanged: (index) {
+                setState(() {
+                  _currentPage = index;
+                });
+                _processPagePanels(index, widget.pageBytes[index]);
+              },
+              itemBuilder: (context, index) {
+                final panels = _detectedPanelsCache[index] ?? [];
+                final imgSize = _imageSizesCache[index];
 
-              return Center(
-                child: InteractiveViewer(
-                  transformationController: _transformationController,
-                  minScale: 1.0,
-                  maxScale: 4.0,
-                  child: Center(
-                    child: imgSize == null
-                        ? Image.memory(widget.pageBytes[index], fit: BoxFit.contain)
-                        : AspectRatio(
-                      aspectRatio: imgSize.width / imgSize.height,
-                      child: Stack(
-                        fit: StackFit.passthrough,
-                        children: [
-                          // 1. Comic Page Image
-                          Image.memory(
-                            widget.pageBytes[index],
-                            fit: BoxFit.contain,
-                            errorBuilder: (context, error, stackTrace) {
-                              return const Center(
-                                child: Text(
-                                  'Error loading page',
-                                  style: TextStyle(color: Colors.red),
-                                ),
-                              );
-                            },
-                          ),
-                          // 2. Exact-fit Outline Boxes & Panel Badges
-                          if (_showPanelOverlays)
-                            CustomPaint(
-                              painter: ComicPanelPainter(panels: panels),
+                return Center(
+                  child: InteractiveViewer(
+                    transformationController: _transformationController,
+                    minScale: 1.0,
+                    maxScale: 5.0,
+                    child: Center(
+                      child: imgSize == null
+                          ? Image.memory(widget.pageBytes[index], fit: BoxFit.contain)
+                          : AspectRatio(
+                        aspectRatio: imgSize.width / imgSize.height,
+                        child: Stack(
+                          fit: StackFit.passthrough,
+                          children: [
+                            Image.memory(
+                              widget.pageBytes[index],
+                              fit: BoxFit.contain,
                             ),
-                        ],
+                            if (_showPanelOverlays)
+                              CustomPaint(
+                                painter: ComicPanelPainter(
+                                  panels: panels,
+                                  activeIndex: _currentPanelIndex,
+                                  showDimming: true,
+                                ),
+                              ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
-                ),
-              );
-            },
+                );
+              },
+            ),
           );
         },
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () {
-          final RenderBox? box = context.findRenderObject() as RenderBox?;
-          if (box != null) {
-            _nextPanel(box.size);
-          }
-        },
-        icon: const Icon(Icons.arrow_forward),
-        label: const Text('Next Panel'),
       ),
     );
   }
