@@ -142,36 +142,84 @@ int process_comic_panels(
     }
 
     std::vector<int> indices;
-    cv::dnn::NMSBoxes(boxes, confidences, 0.40f, 0.45f, indices);
+    cv::dnn::NMSBoxes(boxes, confidences, 0.35f, 0.45f, indices); // Slightly lowered confidence threshold to catch more panels
 
-    // Collect valid boxes after NMS
-    std::vector<cv::Rect> valid_boxes;
+    struct PanelBox {
+        int id;
+        cv::Rect rect;
+    };
+
+    std::vector<PanelBox> candidate_boxes;
+    int id_counter = 1;
+
     for (int idx : indices) {
         const auto& rect = boxes[idx];
-        // Filter out tiny false positives (logos, standalone text bubbles)
-        if (rect.width > 30 && rect.height > 30) {
-            valid_boxes.push_back(rect);
+
+        // 1. RELAXED SIZE & DIMENSION FILTERS (Allows smaller panels)
+        if (rect.width < 25 || rect.height < 25) continue;
+        int area = rect.width * rect.height;
+        if (area < 600) continue; // Lowered area floor significantly
+
+        // 2. Aspect Ratio Filter
+        float aspect_ratio = static_cast<float>(rect.width) / static_cast<float>(rect.height);
+        if (aspect_ratio < 0.15f || aspect_ratio > 6.0f) continue;
+
+        cv::Rect safe_rect = rect & cv::Rect(0, 0, rgb_frame.cols, rgb_frame.rows);
+        if (safe_rect.width <= 0 || safe_rect.height <= 0) continue;
+
+        // Color variance check to filter out solid text blocks
+        cv::Mat panel_crop = rgb_frame(safe_rect);
+        cv::Mat gray_crop;
+        cv::cvtColor(panel_crop, gray_crop, cv::COLOR_RGB2GRAY);
+
+        cv::Scalar mean, stddev;
+        cv::meanStdDev(gray_crop, mean, stddev);
+
+        if (stddev[0] < 15.0) continue; // Slightly adjusted stddev threshold
+
+        candidate_boxes.push_back({id_counter++, safe_rect});
+    }
+
+    // 3. Merging loop for overlapping fragments
+    std::vector<PanelBox> merged_boxes;
+    for (const auto& box_item : candidate_boxes) {
+        bool merged = false;
+        for (auto& existing : merged_boxes) {
+            cv::Rect intersection = box_item.rect & existing.rect;
+            int intersection_area = intersection.area();
+            int smaller_area = std::min(box_item.rect.area(), existing.rect.area());
+
+            float overlap_ratio = (smaller_area > 0) ? (static_cast<float>(intersection_area) / smaller_area) : 0.0f;
+
+            if (intersection_area > 0 && overlap_ratio > 0.45f) {
+                existing.rect = existing.rect | box_item.rect;
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            merged_boxes.push_back(box_item);
         }
     }
 
-    // Sort panels: Top-to-Bottom, Left-to-Right
-    // We use a row tolerance (e.g., 50 pixels) to group panels on the same horizontal row
-    std::sort(valid_boxes.begin(), valid_boxes.end(), [](const cv::Rect& a, const cv::Rect& b) {
-        const int row_tolerance = 50;
-        if (std::abs(a.y - b.y) > row_tolerance) {
-            return a.y < b.y; // Top to bottom
+    // 4. CRITICAL FIX: Re-sort final merged boxes strictly Top-to-Bottom, Left-to-Right
+    std::sort(merged_boxes.begin(), merged_boxes.end(), [](const PanelBox& a, const PanelBox& b) {
+        const int row_tolerance = 45; // Grouping tolerance for same-row panels
+        if (std::abs(a.rect.y - b.rect.y) > row_tolerance) {
+            return a.rect.y < b.rect.y; // Top to bottom
         }
-        return a.x < b.x; // Left to right within the same row
+        return a.rect.x < b.rect.x;     // Left to right within the same row
     });
 
+    // 5. Populate final output array
     int panel_count = 0;
-    for (const auto& rect : valid_boxes) {
+    for (const auto& item : merged_boxes) {
         if (panel_count >= max_panels) break;
 
-        out_rects[panel_count * 4 + 0] = static_cast<float>(rect.x) / width;
-        out_rects[panel_count * 4 + 1] = static_cast<float>(rect.y) / height;
-        out_rects[panel_count * 4 + 2] = static_cast<float>(rect.width) / width;
-        out_rects[panel_count * 4 + 3] = static_cast<float>(rect.height) / height;
+        out_rects[panel_count * 4 + 0] = static_cast<float>(item.rect.x) / width;
+        out_rects[panel_count * 4 + 1] = static_cast<float>(item.rect.y) / height;
+        out_rects[panel_count * 4 + 2] = static_cast<float>(item.rect.width) / width;
+        out_rects[panel_count * 4 + 3] = static_cast<float>(item.rect.height) / height;
 
         panel_count++;
     }
