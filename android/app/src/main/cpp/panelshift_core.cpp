@@ -11,31 +11,21 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Global singleton network instance and load flag
-static cv::dnn::Net net;
+static cv::dnn::Net* g_yolo_net = nullptr;
 static bool is_model_loaded = false;
 
 extern "C" {
 
 // 1. Initializes the YOLO network from local storage path
-JNIEXPORT void JNICALL
-Java_com_panelshift_engine_PanelShiftNativeBridge_initYoloModel(
-        JNIEnv* env, jobject thiz, jstring model_path_jstr) {
-
-    if (env == nullptr || model_path_jstr == nullptr) {
-        LOGE("JNI Env or model path string is null.");
+// Initializes the YOLO network from local storage path via Dart FFI
+__attribute__((visibility("default"))) __attribute__((used))
+void initYoloModel(const char* model_path_cstr) {
+    if (model_path_cstr == nullptr) {
+        LOGE("Model path C-string is null.");
         return;
     }
 
-    const char* path_chars = env->GetStringUTFChars(model_path_jstr, nullptr);
-    if (path_chars == nullptr) {
-        LOGE("Failed to obtain UTF chars from model path jstring.");
-        return;
-    }
-
-    std::string model_path(path_chars);
-    env->ReleaseStringUTFChars(model_path_jstr, path_chars);
-
+    std::string model_path(model_path_cstr);
     LOGI("Attempting to load YOLO model from stable path: %s", model_path.c_str());
 
     // Verify file accessibility using std::ifstream
@@ -50,13 +40,15 @@ Java_com_panelshift_engine_PanelShiftNativeBridge_initYoloModel(
 
     if (!is_model_loaded) {
         try {
-            net = cv::dnn::readNetFromONNX(model_path);
-            if (net.empty()) {
+            cv::dnn::Net loaded_net = cv::dnn::readNetFromONNX(model_path);
+            if (loaded_net.empty()) {
                 LOGE("OpenCV readNetFromONNX returned an empty network structure.");
             } else {
-                net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-                net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+                loaded_net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+                loaded_net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
 
+                // Assign to the heap pointer safely
+                g_yolo_net = new cv::dnn::Net(loaded_net);
                 is_model_loaded = true;
                 LOGI("Successfully initialized and configured YOLO ONNX model!");
             }
@@ -89,7 +81,7 @@ int process_comic_panels(
         return 0;
     }
 
-    if (!is_model_loaded || net.empty()) {
+    if (!is_model_loaded || g_yolo_net == nullptr || g_yolo_net->empty()) {
         LOGE("YOLO model not loaded yet. Falling back to full-page panel.");
         if (max_panels > 0) {
             out_rects[0] = 0.0f;
@@ -100,7 +92,6 @@ int process_comic_panels(
         }
         return 0;
     }
-
     cv::Mat frame(height, width, CV_8UC4, pixel_data);
     cv::Mat rgb_frame;
     cv::cvtColor(frame, rgb_frame, cv::COLOR_RGBA2RGB);
@@ -110,8 +101,14 @@ int process_comic_panels(
 
     cv::Mat blob = cv::dnn::blobFromImage(rgb_frame, 1.0 / 255.0, cv::Size(input_width, input_height), cv::Scalar(0, 0, 0), true, false);
 
-    net.setInput(blob);
-    cv::Mat detections = net.forward();
+    g_yolo_net->setInput(blob);
+    cv::Mat detections = g_yolo_net->forward();
+
+    // Validate tensor dimensions to prevent out-of-bounds segfaults
+    if (detections.dims < 3) {
+        LOGE("Invalid detection tensor dimensions: %d", detections.dims);
+        return 0;
+    }
 
     std::vector<cv::Rect> boxes;
     std::vector<float> confidences;
@@ -147,10 +144,29 @@ int process_comic_panels(
     std::vector<int> indices;
     cv::dnn::NMSBoxes(boxes, confidences, 0.40f, 0.45f, indices);
 
-    int panel_count = 0;
+    // Collect valid boxes after NMS
+    std::vector<cv::Rect> valid_boxes;
     for (int idx : indices) {
-        if (panel_count >= max_panels) break;
         const auto& rect = boxes[idx];
+        // Filter out tiny false positives (logos, standalone text bubbles)
+        if (rect.width > 30 && rect.height > 30) {
+            valid_boxes.push_back(rect);
+        }
+    }
+
+    // Sort panels: Top-to-Bottom, Left-to-Right
+    // We use a row tolerance (e.g., 50 pixels) to group panels on the same horizontal row
+    std::sort(valid_boxes.begin(), valid_boxes.end(), [](const cv::Rect& a, const cv::Rect& b) {
+        const int row_tolerance = 50;
+        if (std::abs(a.y - b.y) > row_tolerance) {
+            return a.y < b.y; // Top to bottom
+        }
+        return a.x < b.x; // Left to right within the same row
+    });
+
+    int panel_count = 0;
+    for (const auto& rect : valid_boxes) {
+        if (panel_count >= max_panels) break;
 
         out_rects[panel_count * 4 + 0] = static_cast<float>(rect.x) / width;
         out_rects[panel_count * 4 + 1] = static_cast<float>(rect.y) / height;
@@ -158,14 +174,6 @@ int process_comic_panels(
         out_rects[panel_count * 4 + 3] = static_cast<float>(rect.height) / height;
 
         panel_count++;
-    }
-
-    if (panel_count == 0 && max_panels > 0) {
-        out_rects[0] = 0.0f;
-        out_rects[1] = 0.0f;
-        out_rects[2] = 1.0f;
-        out_rects[3] = 1.0f;
-        panel_count = 1;
     }
 
     LOGI("YOLO successfully extracted %d comic panels.", panel_count);
