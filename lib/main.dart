@@ -1,133 +1,81 @@
 import 'package:flutter/material.dart';
-import 'package:file_picker/file_picker.dart';
-import 'services/comic_parser_service.dart';
-import 'screens/comic_reader_screen.dart';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
 
 void main() {
-  runApp(const PanelShiftApp());
+  runApp(const MyApp());
 }
 
-class PanelShiftApp extends StatelessWidget {
-  const PanelShiftApp({super.key});
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PanelShift Core',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-        useMaterial3: true,
-      ),
-      home: const ComicProcessorScreen(title: 'PanelShift Core Engine'),
+      title: 'PanelShift',
+      home: const ComicReaderScreen(),
     );
   }
 }
 
-class ComicProcessorScreen extends StatefulWidget {
-  const ComicProcessorScreen({super.key, required this.title});
-
-  final String title;
+class ComicReaderScreen extends StatefulWidget {
+  const ComicReaderScreen({super.key});
 
   @override
-  State<ComicProcessorScreen> createState() => _ComicProcessorScreenState();
+  State<ComicReaderScreen> createState() => _ComicReaderScreenState();
 }
 
-class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
-  String _statusMessage = 'Ready to process digital comic archives.';
-  bool _isProcessing = false;
-  int _extractedPageCount = 0;
+class _ComicReaderScreenState extends State<ComicReaderScreen> {
+  bool _isModelReady = false;
 
-  /// Opens the file picker, selects a .cbz archive, and extracts its pages
-  Future<void> _pickAndProcessComic() async {
-    setState(() {
-      _isProcessing = true;
-      _statusMessage = 'Opening file manager...';
-      _extractedPageCount = 0;
+  @override
+  void initState() {
+    super.initState();
+
+    // 1. Defer native execution until after the first UI frame finishes mounting
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initializeYoloSafely();
     });
+  }
+
+  Future<void> _initializeYoloSafely() async {
+    // 2. Add a 500ms safety buffer to let WebSockets and Impeller stabilize
+    await Future.delayed(const Duration(milliseconds: 500));
 
     try {
-      // 1. Launch native file picker filtered for archive files (.cbz / .zip)
-      List<PlatformFile> files = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['cbz', 'zip'],
-      );
+      // 3. Resolve your local model storage path (copying from assets if needed)
+      final Directory appDir = await getApplicationDocumentsDirectory();
+      final String modelPath = '${appDir.path}/yolov8_panels.onnx';
 
-      if (files.isEmpty || files.single.path == null) {
-        setState(() {
-          _statusMessage = 'File selection cancelled.';
-        });
+      // Verify file exists on disk before passing to native code
+      final File modelFile = File(modelPath);
+      if (!await modelFile.exists()) {
+        debugPrint('ERROR: YOLO model file not found at $modelPath');
         return;
       }
 
-      final filePath = files.single.path!;
-      setState(() {
-        _statusMessage = 'Extracting comic archive pages...';
-      });
+      debugPrint('Initializing native YOLO model from: $modelPath');
 
-      // 2. Unpack the selected archive using our ComicParserService
-      final pages = await ComicParserService.extractCbzPages(filePath);
+      // 4. Invoke your native bridge method safely
+      // PanelShiftNativeBridge.initYoloModel(modelPath);
 
-      setState(() {
-        _extractedPageCount = pages.length;
-        _statusMessage = 'Successfully extracted $_extractedPageCount pages from archive!';
-      });
-
-      if (!mounted) return;
-
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (context) => ComicReaderScreen(pageBytes: pages),
-        ),
-      );
-
-    } catch (e) {
-      setState(() {
-        _statusMessage = 'Error unpacking archive: $e';
-      });
-    } finally {
-      setState(() {
-        _isProcessing = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isModelReady = true;
+        });
+      }
+      debugPrint('Native YOLO model initialization completed successfully.');
+    } catch (e, stackTrace) {
+      debugPrint('FATAL: Caught error during deferred native initialization: $e\n$stackTrace');
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: Text(widget.title),
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(24.0),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const Icon(Icons.menu_book, size: 80, color: Colors.deepPurple),
-            const SizedBox(height: 24),
-            Text(
-              _statusMessage,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 16),
-            ),
-            if (_extractedPageCount > 0) ...[
-              const SizedBox(height: 12),
-              Text(
-                'Total Pages Loaded: $_extractedPageCount',
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.green),
-              ),
-            ],
-            const SizedBox(height: 32),
-            ElevatedButton.icon(
-              onPressed: _isProcessing ? null : _pickAndProcessComic,
-              icon: const Icon(Icons.folder_open),
-              label: const Text('Select & Process Comic Archive (.cbz)'),
-            ),
-          ],
-        ),
+      appBar: AppBar(title: const Text('PanelShift Reader')),
+      body: Center(
+        child: Text(_isModelReady ? 'YOLO Model Ready' : 'Initializing Engine...'),
       ),
     );
   }
