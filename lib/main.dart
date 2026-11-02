@@ -149,7 +149,7 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
 }
 
 /// ==========================================
-/// 2. Comic Panel Painter with Dimming
+/// 2. Comic Panel Painter with Dimming Support
 /// ==========================================
 class ComicPanelPainter extends CustomPainter {
   final List<ComicPanel> panels;
@@ -204,7 +204,7 @@ class ComicPanelPainter extends CustomPainter {
         panel.height * size.height,
       );
 
-      final isCurrent = (i == activeIndex);
+      final isCurrent = (i == activeIndex && showDimming);
       canvas.drawRect(rect, isCurrent ? activeStrokePaint : strokePaint);
 
       final textSpan = TextSpan(
@@ -235,7 +235,7 @@ class ComicPanelPainter extends CustomPainter {
 }
 
 /// ==========================================
-/// 3. Comic Reader Screen with Double View & Panel Navigation
+/// 3. Comic Reader Screen
 /// ==========================================
 class ComicReaderScreen extends StatefulWidget {
   final List<Uint8List> pageBytes;
@@ -254,6 +254,10 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
 
   final Map<int, List<ComicPanel>> _detectedPanelsCache = {};
   final Map<int, Size> _imageSizesCache = {};
+
+  List<List<int>> _singleLayout = [];
+  List<List<int>> _doubleLayout = [];
+
   int _currentPage = 0;
   int _currentPanelIndex = 0;
   bool _isAnalyzing = false;
@@ -261,6 +265,9 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
   bool _showPanelOverlays = true;
   bool _showUI = true;
   bool _isDoublePageView = false;
+  bool _enableFullPageStep = false;
+  bool _isFullPageActive = false;
+  bool _isScreenLocked = true;
   Size? _lastViewportSize;
 
   @override
@@ -277,24 +284,36 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
       }
     });
 
+    for (int i = 0; i < widget.pageBytes.length; i++) {
+      _singleLayout.add([i]);
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await Future.delayed(const Duration(milliseconds: 500));
+      await Future.delayed(const Duration(milliseconds: 300));
 
       try {
         await NativeOpenCvService.initializeEngine();
+
+        for (int i = 0; i < widget.pageBytes.length; i++) {
+          final ui.Codec codec = await ui.instantiateImageCodec(widget.pageBytes[i]);
+          final ui.FrameInfo frame = await codec.getNextFrame();
+          _imageSizesCache[i] = Size(frame.image.width.toDouble(), frame.image.height.toDouble());
+        }
+
+        _buildDoubleLayout();
 
         if (mounted) {
           setState(() {
             _isEngineReady = true;
           });
         }
-        debugPrint('YOLO engine initialized successfully in reader screen.');
+        debugPrint('YOLO engine & layout pre-calculated successfully.');
 
         if (widget.pageBytes.isNotEmpty) {
           _processPagePanels(0, widget.pageBytes[0]);
         }
       } catch (e, stackTrace) {
-        debugPrint('FATAL: Error initializing native OpenCV engine: $e\n$stackTrace');
+        debugPrint('FATAL: Error initializing engine/sizes: $e\n$stackTrace');
       }
     });
   }
@@ -307,15 +326,8 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
     super.dispose();
   }
 
-  List<List<int>> _getEffectiveLayout() {
+  void _buildDoubleLayout() {
     List<List<int>> layout = [];
-    if (!_isDoublePageView) {
-      for (int i = 0; i < widget.pageBytes.length; i++) {
-        layout.add([i]);
-      }
-      return layout;
-    }
-
     int i = 0;
     while (i < widget.pageBytes.length) {
       final size = _imageSizesCache[i];
@@ -337,7 +349,11 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
         }
       }
     }
-    return layout;
+    _doubleLayout = layout;
+  }
+
+  List<List<int>> _getEffectiveLayout() {
+    return _isDoublePageView ? _doubleLayout : _singleLayout;
   }
 
   int _findVirtualPageIndex(int targetPhysicalPage) {
@@ -354,24 +370,18 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
     if (_detectedPanelsCache.containsKey(index) || (_isAnalyzing && _currentPage == index) || !_isEngineReady) return;
 
     try {
-      final ui.Codec codec = await ui.instantiateImageCodec(compressedBytes);
-      final ui.FrameInfo frame = await codec.getNextFrame();
-      final ui.Image image = frame.image;
-
-      final int width = image.width;
-      final int height = image.height;
-      _imageSizesCache[index] = Size(width.toDouble(), height.toDouble());
-
       if (index == 0) {
-        setState(() {
-          _detectedPanelsCache[0] = [
-            const ComicPanel(x: 0.0, y: 0.0, width: 1.0, height: 1.0)
-          ];
-        });
+        _detectedPanelsCache[0] = [const ComicPanel(x: 0.0, y: 0.0, width: 1.0, height: 1.0)];
         return;
       }
 
       setState(() => _isAnalyzing = true);
+
+      final ui.Codec codec = await ui.instantiateImageCodec(compressedBytes);
+      final ui.FrameInfo frame = await codec.getNextFrame();
+      final ui.Image image = frame.image;
+      final int width = image.width;
+      final int height = image.height;
 
       final ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
       if (byteData == null) return;
@@ -384,7 +394,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
         _detectedPanelsCache[index] = panels;
       });
 
-      if (index == _currentPage && panels.isNotEmpty && _lastViewportSize != null) {
+      if (index == _currentPage && panels.isNotEmpty && _lastViewportSize != null && !_isFullPageActive) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted && _currentPage == index) {
             _focusOnPanel(panels[_currentPanelIndex], _lastViewportSize!);
@@ -404,8 +414,19 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
     _transformationController.value = Matrix4.identity();
   }
 
+  void _animateToFullPage() {
+    final Matrix4 beginMatrix = _transformationController.value;
+    final Matrix4 endMatrix = Matrix4.identity();
+
+    _zoomAnimation = Matrix4Tween(begin: beginMatrix, end: endMatrix).animate(
+      CurvedAnimation(parent: _animationController, curve: Curves.easeInOutCubic),
+    );
+
+    _animationController.forward(from: 0.0);
+  }
+
   void _focusOnPanel(ComicPanel panel, Size viewportSize) {
-    if (viewportSize.width == 0 || viewportSize.height == 0) return;
+    if (viewportSize.width == 0 || viewportSize.height == 0 || _isFullPageActive) return;
 
     final layout = _getEffectiveLayout();
     final virtualIndex = _findVirtualPageIndex(_currentPage);
@@ -491,10 +512,39 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
   }
 
   void _nextPanel(Size viewportSize) {
+    if (_isFullPageActive) {
+      setState(() {
+        _isFullPageActive = false;
+      });
+      final layout = _getEffectiveLayout();
+      final virtualIndex = _findVirtualPageIndex(_currentPage);
+
+      if (virtualIndex < layout.length - 1) {
+        _resetZoomInstant();
+        final nextPhysicalPages = layout[virtualIndex + 1];
+        setState(() {
+          _currentPage = nextPhysicalPages[0];
+          _currentPanelIndex = 0;
+        });
+        _pageController.animateToPage(
+          virtualIndex + 1,
+          duration: const Duration(milliseconds: 350),
+          curve: Curves.easeInOut,
+        ).then((_) {
+          final newPanels = _detectedPanelsCache[_currentPage] ?? [];
+          if (newPanels.isNotEmpty) {
+            _focusOnPanel(newPanels[0], viewportSize);
+          }
+        });
+      }
+      return;
+    }
+
     final layout = _getEffectiveLayout();
     final virtualIndex = _findVirtualPageIndex(_currentPage);
     final physicalPages = layout[virtualIndex];
-    final panels = _detectedPanelsCache[_currentPage] ?? [];
+
+    bool isAtLastPanel = false;
 
     if (_isDoublePageView && physicalPages.length == 2) {
       final pageA = physicalPages[0];
@@ -508,7 +558,6 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
           _focusOnPanel(panelsA[_currentPanelIndex], viewportSize);
           return;
         } else {
-          // Switch to Page B (right page) in same spread
           setState(() {
             _currentPage = pageB;
             _currentPanelIndex = 0;
@@ -523,23 +572,36 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
           setState(() => _currentPanelIndex++);
           _focusOnPanel(panelsB[_currentPanelIndex], viewportSize);
           return;
+        } else {
+          isAtLastPanel = true;
         }
       }
     } else {
+      final panels = _detectedPanelsCache[_currentPage] ?? [];
       if (_currentPanelIndex < panels.length - 1) {
         setState(() => _currentPanelIndex++);
         _focusOnPanel(panels[_currentPanelIndex], viewportSize);
         return;
+      } else {
+        isAtLastPanel = true;
       }
     }
 
-    // Advance to next virtual page layout
+    if (_enableFullPageStep && isAtLastPanel && !_isFullPageActive) {
+      setState(() {
+        _isFullPageActive = true;
+      });
+      _animateToFullPage();
+      return;
+    }
+
     if (virtualIndex < layout.length - 1) {
       _resetZoomInstant();
       final nextPhysicalPages = layout[virtualIndex + 1];
       setState(() {
         _currentPage = nextPhysicalPages[0];
         _currentPanelIndex = 0;
+        _isFullPageActive = false;
       });
       _pageController.animateToPage(
         virtualIndex + 1,
@@ -555,6 +617,37 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
   }
 
   void _prevPanel(Size viewportSize) {
+    if (_isFullPageActive) {
+      setState(() {
+        _isFullPageActive = false;
+      });
+      final layout = _getEffectiveLayout();
+      final virtualIndex = _findVirtualPageIndex(_currentPage);
+      final physicalPages = layout[virtualIndex];
+
+      if (_isDoublePageView && physicalPages.length == 2) {
+        setState(() {
+          _currentPage = physicalPages[1];
+        });
+        final panelsB = _detectedPanelsCache[physicalPages[1]] ?? [];
+        setState(() {
+          _currentPanelIndex = panelsB.isNotEmpty ? panelsB.length - 1 : 0;
+        });
+        if (panelsB.isNotEmpty) {
+          _focusOnPanel(panelsB[_currentPanelIndex], viewportSize);
+        }
+      } else {
+        final panels = _detectedPanelsCache[_currentPage] ?? [];
+        setState(() {
+          _currentPanelIndex = panels.isNotEmpty ? panels.length - 1 : 0;
+        });
+        if (panels.isNotEmpty) {
+          _focusOnPanel(panels[_currentPanelIndex], viewportSize);
+        }
+      }
+      return;
+    }
+
     final layout = _getEffectiveLayout();
     final virtualIndex = _findVirtualPageIndex(_currentPage);
     final physicalPages = layout[virtualIndex];
@@ -571,7 +664,6 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
           _focusOnPanel(panelsB[_currentPanelIndex], viewportSize);
           return;
         } else {
-          // Switch back to Page A (left page) last panel
           setState(() {
             _currentPage = pageA;
             _currentPanelIndex = panelsA.isNotEmpty ? panelsA.length - 1 : 0;
@@ -597,27 +689,55 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
       }
     }
 
-    // Go to previous virtual page layout
     if (virtualIndex > 0) {
       _resetZoomInstant();
       final prevPhysicalPages = layout[virtualIndex - 1];
       setState(() {
         _currentPage = prevPhysicalPages.last;
-      });
-      final prevPanels = _detectedPanelsCache[_currentPage] ?? [];
-      setState(() {
-        _currentPanelIndex = prevPanels.isNotEmpty ? prevPanels.length - 1 : 0;
+        _currentPanelIndex = 0;
+        _isFullPageActive = true;
       });
       _pageController.animateToPage(
         virtualIndex - 1,
         duration: const Duration(milliseconds: 350),
         curve: Curves.easeInOut,
-      ).then((_) {
-        final loadedPrevPanels = _detectedPanelsCache[_currentPage] ?? [];
-        if (loadedPrevPanels.isNotEmpty) {
-          _focusOnPanel(loadedPrevPanels[_currentPanelIndex], viewportSize);
-        }
+      );
+    }
+  }
+
+  void _nextPageFree() {
+    final layout = _getEffectiveLayout();
+    final virtualIndex = _findVirtualPageIndex(_currentPage);
+    if (virtualIndex < layout.length - 1) {
+      _resetZoomInstant();
+      setState(() {
+        _currentPage = layout[virtualIndex + 1][0];
+        _currentPanelIndex = 0;
+        _isFullPageActive = true;
       });
+      _pageController.animateToPage(
+        virtualIndex + 1,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeInOut,
+      );
+    }
+  }
+
+  void _prevPageFree() {
+    final layout = _getEffectiveLayout();
+    final virtualIndex = _findVirtualPageIndex(_currentPage);
+    if (virtualIndex > 0) {
+      _resetZoomInstant();
+      setState(() {
+        _currentPage = layout[virtualIndex - 1][0];
+        _currentPanelIndex = 0;
+        _isFullPageActive = true;
+      });
+      _pageController.animateToPage(
+        virtualIndex - 1,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeInOut,
+      );
     }
   }
 
@@ -625,6 +745,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
     final double screenWidth = viewportSize.width;
     final double tapX = details.localPosition.dx;
 
+    // Tap actions are ALWAYS fully functional regardless of lock mode
     if (tapX < screenWidth * 0.3) {
       _prevPanel(viewportSize);
     } else if (tapX > screenWidth * 0.7) {
@@ -642,77 +763,135 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
 
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: _showUI
-          ? AppBar(
-        backgroundColor: Colors.black.withOpacity(0.8),
-        title: Text(
-          'PanelShift Reader (${_currentPage + 1}/${widget.pageBytes.length})',
-          style: const TextStyle(color: Colors.white),
-        ),
-        iconTheme: const IconThemeData(color: Colors.white),
-        actions: [
-          IconButton(
-            icon: Icon(_isDoublePageView ? Icons.menu_book : Icons.chrome_reader_mode),
-            tooltip: _isDoublePageView ? 'Switch to Single View' : 'Switch to Double View',
-            onPressed: () {
-              setState(() {
-                _isDoublePageView = !_isDoublePageView;
-                _resetZoomInstant();
-                _currentPanelIndex = 0;
-              });
-            },
-          ),
-          IconButton(
-            icon: Icon(_showPanelOverlays ? Icons.layers : Icons.layers_outlined),
-            tooltip: 'Toggle Panel Overlays',
-            onPressed: () {
-              setState(() {
-                _showPanelOverlays = !_showPanelOverlays;
-              });
-            },
-          ),
-        ],
-      )
-          : null,
       body: !_isEngineReady
           ? const Center(child: CircularProgressIndicator())
           : LayoutBuilder(
         builder: (context, constraints) {
           _lastViewportSize = constraints.biggest;
-          return GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTapUp: (details) => _handleScreenTap(details, constraints.biggest),
-            child: PageView.builder(
-              controller: _pageController,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: layout.length,
-              onPageChanged: (virtualIndex) {
-                final physicalPages = layout[virtualIndex];
-                setState(() {
-                  _currentPage = physicalPages[0];
-                  _currentPanelIndex = 0;
-                });
-                for (var pageIdx in physicalPages) {
-                  _processPagePanels(pageIdx, widget.pageBytes[pageIdx]);
+          return Stack(
+            children: [
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTapUp: (details) => _handleScreenTap(details, constraints.biggest),
+                // Swipe is ONLY enabled when unlocked AND in unzoomed/full-page mode
+                onHorizontalDragEnd: (!_isScreenLocked && (_isFullPageActive || _transformationController.value == Matrix4.identity()))
+                    ? (details) {
+                  if (details.primaryVelocity != null) {
+                    if (details.primaryVelocity! < -300) {
+                      _nextPageFree();
+                    } else if (details.primaryVelocity! > 300) {
+                      _prevPageFree();
+                    }
+                  }
                 }
-              },
-              itemBuilder: (context, virtualIndex) {
-                final physicalPages = layout[virtualIndex];
+                    : null,
+                child: PageView.builder(
+                  controller: _pageController,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: layout.length,
+                  onPageChanged: (virtualIndex) {
+                    final physicalPages = layout[virtualIndex];
+                    setState(() {
+                      _currentPage = physicalPages[0];
+                      _currentPanelIndex = 0;
+                    });
+                    for (var pageIdx in physicalPages) {
+                      _processPagePanels(pageIdx, widget.pageBytes[pageIdx]);
+                    }
+                  },
+                  itemBuilder: (context, virtualIndex) {
+                    final physicalPages = layout[virtualIndex];
 
-                return Center(
-                  child: InteractiveViewer(
-                    transformationController: _transformationController,
-                    minScale: 1.0,
-                    maxScale: 5.0,
-                    child: Center(
-                      child: physicalPages.length == 1
-                          ? _buildSinglePageWidget(physicalPages[0])
-                          : _buildDoublePageWidget(physicalPages[0], physicalPages[1]),
+                    return Center(
+                      child: InteractiveViewer(
+                        transformationController: _transformationController,
+                        minScale: 1.0,
+                        maxScale: 5.0,
+                        child: Center(
+                          child: physicalPages.length == 1
+                              ? _buildSinglePageWidget(physicalPages[0])
+                              : _buildDoublePageWidget(physicalPages[0], physicalPages[1]),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+              if (_showUI)
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: AnimatedOpacity(
+                    opacity: _showUI ? 1.0 : 0.0,
+                    duration: const Duration(milliseconds: 200),
+                    child: AppBar(
+                      backgroundColor: Colors.black.withOpacity(0.8),
+                      title: Text(
+                        'PanelShift Reader (${_currentPage + 1}/${widget.pageBytes.length})',
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                      iconTheme: const IconThemeData(color: Colors.white),
+                      actions: [
+                        IconButton(
+                          icon: Icon(_isScreenLocked ? Icons.lock : Icons.lock_open),
+                          tooltip: _isScreenLocked ? 'Unlock Swipe (Full-Page Only)' : 'Lock Screen (Strict Tap)',
+                          onPressed: () {
+                            setState(() {
+                              _isScreenLocked = !_isScreenLocked;
+                            });
+                          },
+                        ),
+                        IconButton(
+                          icon: Icon(_enableFullPageStep ? Icons.fullscreen : Icons.fullscreen_exit),
+                          tooltip: _enableFullPageStep ? 'Disable Full Page Step' : 'Enable Full Page Step',
+                          onPressed: () {
+                            setState(() {
+                              _enableFullPageStep = !_enableFullPageStep;
+                            });
+                          },
+                        ),
+                        IconButton(
+                          icon: Icon(_isDoublePageView ? Icons.menu_book : Icons.chrome_reader_mode),
+                          tooltip: _isDoublePageView ? 'Switch to Single View' : 'Switch to Double View',
+                          onPressed: () {
+                            setState(() {
+                              _isDoublePageView = !_isDoublePageView;
+                              _resetZoomInstant();
+                              _currentPanelIndex = 0;
+                              _isFullPageActive = true;
+                            });
+
+                            WidgetsBinding.instance.addPostFrameCallback((_) {
+                              if (!mounted) return;
+                              final newLayout = _getEffectiveLayout();
+                              int newVirtualIdx = 0;
+                              for (int vi = 0; vi < newLayout.length; vi++) {
+                                if (newLayout[vi].contains(_currentPage)) {
+                                  newVirtualIdx = vi;
+                                  break;
+                                }
+                              }
+                              if (_pageController.hasClients) {
+                                _pageController.jumpToPage(newVirtualIdx);
+                              }
+                            });
+                          },
+                        ),
+                        IconButton(
+                          icon: Icon(_showPanelOverlays ? Icons.layers : Icons.layers_outlined),
+                          tooltip: 'Toggle Panel Overlays',
+                          onPressed: () {
+                            setState(() {
+                              _showPanelOverlays = !_showPanelOverlays;
+                            });
+                          },
+                        ),
+                      ],
                     ),
                   ),
-                );
-              },
-            ),
+                ),
+            ],
           );
         },
       ),
@@ -738,8 +917,8 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
             CustomPaint(
               painter: ComicPanelPainter(
                 panels: panels,
-                activeIndex: _currentPage == pageIndex ? _currentPanelIndex : -1,
-                showDimming: true,
+                activeIndex: (_currentPage == pageIndex && !_isFullPageActive) ? _currentPanelIndex : -1,
+                showDimming: !_isFullPageActive,
               ),
             ),
         ],
@@ -791,8 +970,8 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
                       CustomPaint(
                         painter: ComicPanelPainter(
                           panels: _detectedPanelsCache[pageA] ?? [],
-                          activeIndex: _currentPage == pageA ? _currentPanelIndex : -1,
-                          showDimming: true,
+                          activeIndex: (_currentPage == pageA && !_isFullPageActive) ? _currentPanelIndex : -1,
+                          showDimming: !_isFullPageActive,
                         ),
                       ),
                   ],
@@ -809,8 +988,8 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
                       CustomPaint(
                         painter: ComicPanelPainter(
                           panels: _detectedPanelsCache[pageB] ?? [],
-                          activeIndex: _currentPage == pageB ? _currentPanelIndex : -1,
-                          showDimming: true,
+                          activeIndex: (_currentPage == pageB && !_isFullPageActive) ? _currentPanelIndex : -1,
+                          showDimming: !_isFullPageActive,
                         ),
                       ),
                   ],
