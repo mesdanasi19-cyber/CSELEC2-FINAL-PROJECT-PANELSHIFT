@@ -922,8 +922,8 @@ class _ComicReaderScreenState extends State<ComicReaderScreen> with SingleTicker
         final double maxHeight = constraints.maxHeight;
         final double maxWidth = constraints.maxWidth;
 
-        final double wA = sizeA != null ? maxHeight * (sizeA.width / sizeA.height) : maxWidth / 2;
         final double wB = sizeB != null ? maxHeight * (sizeB.width / sizeB.height) : maxWidth / 2;
+        final double wA = sizeA != null ? maxHeight * (sizeA.width / sizeA.height) : wB;
 
         double scale = 1.0;
         if ((wA + wB) > maxWidth) {
