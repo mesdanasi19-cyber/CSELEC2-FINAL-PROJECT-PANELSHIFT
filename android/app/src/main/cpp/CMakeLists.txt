@@ -16,6 +16,7 @@ add_library(
         panelshift_core
         SHARED
         panelshift_core.cpp
+        panel_postprocess.h
 )
 
 # Find Android system libraries needed for logging and bitmap manipulation

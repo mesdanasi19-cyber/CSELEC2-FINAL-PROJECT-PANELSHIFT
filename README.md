@@ -128,7 +128,7 @@ flutter run --release
 
 ## Developer Note: Python Prototype
 
-Inside `prototypes/panelshift_yolo.py`, you'll find a standalone Python reference script. This file was used to benchmark algorithm accuracy and Non-Maximum Suppression (NMS) parameters during prototyping before porting the pipeline into high-performance C++ (`panelshift_core.cpp`) for production native deployment.
+Inside `prototypes/panelshift_yolo.py`, you'll find a standalone Python reference script. This file was used to benchmark algorithm accuracy and Non-Maximum Suppression (NMS) parameters during prototyping before porting the pipeline into high-performance C++ (`panelshift_coreV0_Prototype.txt`) for production native deployment.
 
 ---
 
