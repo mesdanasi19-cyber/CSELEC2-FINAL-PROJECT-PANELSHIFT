@@ -24,6 +24,30 @@ enum FullPageStepMode { none, afterLast, beforeFirst, both }
 // Explicit state tracking for full-page positions
 enum FullPagePosition { none, beforeFirst, afterLast }
 
+// How pages change: the custom page curl, or a plain horizontal PageView slide
+enum PageTransitionMode { curl, swipe }
+
+// Header title: strips the folder and any trailing archive/document extension
+// (Batman_01.cbz -> Batman_01). Only known comic/archive types are removed, so
+// titles like "Batman v1.5" keep their dot.
+final RegExp _comicExtension = RegExp(
+  r'\.(cbz|cbr|cb7|cbt|cba|zip|rar|7z|tar|pdf|epub)$',
+  caseSensitive: false,
+);
+
+String _comicDisplayTitle(String? raw) {
+  if (raw == null) return '';
+  String name = raw.trim();
+  final int slash = math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+  if (slash >= 0) name = name.substring(slash + 1);
+  String previous;
+  do {
+    previous = name;
+    name = name.replaceFirst(_comicExtension, '');
+  } while (name != previous);
+  return name.trim();
+}
+
 // A single panel inside a spread: which physical page, and which panel on it
 class _PanelRef {
   final int page;
@@ -127,17 +151,28 @@ class ComicReaderScreen extends StatefulWidget {
   /// When null, nothing is saved or restored.
   final ComicIdentity? comic;
 
-  const ComicReaderScreen({super.key, required this.source, this.comic});
+  /// Name shown in the header. Pass the comic's title or file name; a file
+  /// extension such as ".cbz" is removed for display.
+  final String? title;
+
+  const ComicReaderScreen({
+    super.key,
+    required this.source,
+    this.comic,
+    this.title,
+  });
 
   /// For callers that still hold every page in memory.
   factory ComicReaderScreen.fromBytes({
     Key? key,
     required List<Uint8List> pageBytes,
     ComicIdentity? comic,
+    String? title,
   }) => ComicReaderScreen(
     key: key,
     source: InMemoryPageSource(pageBytes),
     comic: comic,
+    title: title,
   );
 
   @override
@@ -159,7 +194,9 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // Virtual page the PageView opens on. Set by the progress restore before the
   // first build; the controller is created lazily so it can use it.
   int _initialVirtualPage = 0;
-  late final PageController _pageController = PageController(
+  // Not final: switching between the page curl and the plain PageView creates
+  // a fresh controller (see _setTransitionMode).
+  late PageController _pageController = PageController(
     initialPage: _initialVirtualPage,
   );
   late final TransformationController _transformationController;
@@ -192,18 +229,41 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // dangle forever on a stalled worker. Nothing on the gesture path uses it.
   static const Duration _panelBackgroundCeiling = Duration(seconds: 15);
 
-  // Spread slide and the guards around it. The guard is deliberately only a
-  // little longer than the animation, so a stuck animation cannot hold the
-  // navigation lock.
-  static const Duration _slideDuration = Duration(milliseconds: 500);
-  static const Duration _slideGuard = Duration(milliseconds: 300);
+  // Page-turn timing. Everything is defined at a base speed of 1.0x and divided
+  // by [_pageTurnSpeed], so 1.5x is 1.5 times faster and 0.5x twice as slow.
+  // The 1.0x base is deliberately slow and relaxed, like turning a real page.
+  static const Duration _baseSlideDuration = Duration(milliseconds: 900);
+  // How long the slide is awaited before the code after it may continue. It
+  // keeps the 60% proportion of the original 300 ms guard on a 500 ms slide;
+  // the animation keeps running past it, and anything that needs a settled
+  // pager is parked until then (_focusOnPanel / _resetZoomInstant).
+  static const Duration _baseSlideGuard = Duration(milliseconds: 540);
   static const Duration _frameGuard = Duration(milliseconds: 120);
+  // Extra time the navigation watchdog allows beyond the slide guard (covers
+  // the short wait for a fresh curl snapshot, see _refreshCurlSnapshotForTurn).
+  static const Duration _navLockSlack = Duration(milliseconds: 300);
+  // Gentler than the old easeInOutCubic: slower start and stop.
+  static const Curve _pageTurnCurve = Curves.easeInOutSine;
+
+  static const List<double> _pageTurnSpeedOptions = <double>[
+    0.5,
+    0.75,
+    1.0,
+    1.5,
+    2.0,
+  ];
+  double _pageTurnSpeed = 1.0;
+
+  Duration _scaledByTurnSpeed(Duration base) => Duration(
+    microseconds: (base.inMicroseconds / _pageTurnSpeed).round(),
+  );
+  Duration get _slideDuration => _scaledByTurnSpeed(_baseSlideDuration);
+  Duration get _slideGuard => _scaledByTurnSpeed(_baseSlideGuard);
 
   // Hard upper bound for _navBusy. Whatever happens inside a transition, the
-  // lock is released by a timer after this long. It covers the slide plus the
-  // short wait for a fresh curl snapshot (_refreshCurlSnapshotForTurn), so it
-  // cannot expire while a transition is still legitimately running.
-  static const Duration _navLockMax = Duration(milliseconds: 600);
+  // lock is released by a timer after this long. It covers the slide guard
+  // plus the short wait for a fresh curl snapshot (_refreshCurlSnapshotForTurn).
+  Duration get _navLockMax => _slideGuard + _navLockSlack;
   int _navToken = 0;
   Timer? _navWatchdog;
 
@@ -237,6 +297,13 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   bool _showUI = true;
   bool _isDoublePageView = false;
 
+  // Reading transition: the custom page curl or a plain horizontal slide.
+  PageTransitionMode _transitionMode = PageTransitionMode.curl;
+  bool get _useCurl => _transitionMode == PageTransitionMode.curl;
+
+  // Bottom control hub: is the secondary row (sound, dimming, ...) open?
+  bool _showMoreControls = false;
+
   // Curl indices are layout-relative. Disable the curl layer while switching
   // between single-page and spread layouts, then re-enable it after the
   // PageController has been moved to the matching index in the new layout.
@@ -259,6 +326,10 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   bool _curlSnapshotDirty = false;
   int _layoutEpoch = 0;
   bool _pagerListenerAttached = false;
+  // Swipe mode only: the curl layer reports turn starts itself, the plain
+  // PageView does not, so the page-turn sound follows the pager position.
+  int? _lastSettledVirtual;
+  bool _swipeTurnSoundFired = false;
   // Virtual index whose live content is zoomed, as the curl layer sees it.
   int? _curlZoomedVirtual;
   // Virtual index that owns the shared TransformationController.
@@ -331,6 +402,52 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
               ],
             );
           },
+        );
+      },
+    );
+  }
+
+  String _formatSpeed(double speed) => '${speed}x';
+
+  void _showTurnSpeedDialog() {
+    showDialog<void>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          title: const Text('Page-Turn Speed'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final double option in _pageTurnSpeedOptions)
+                    ChoiceChip(
+                      label: Text(_formatSpeed(option)),
+                      selected: option == _pageTurnSpeed,
+                      onSelected: (_) {
+                        setState(() => _pageTurnSpeed = option);
+                        Navigator.of(dialogContext).pop();
+                      },
+                    ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Text(
+                '1.0x is a relaxed, book-like turn. Higher is faster, lower '
+                'is slower. Applies to tap-zone and slider page turns.',
+                style: Theme.of(dialogContext).textTheme.bodySmall,
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Close'),
+            ),
+          ],
         );
       },
     );
@@ -1196,8 +1313,27 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
 
   bool _settleCallbackScheduled = false;
 
+  // Swipe mode: announces the first movement away from a settled page, the
+  // same moment ComicCurlPageView calls onPageTurnStarted in curl mode.
+  void _trackSwipeTurnForSound() {
+    final double? page = _safePagerPage();
+    if (page == null) return;
+    final double nearest = page.roundToDouble();
+    if ((page - nearest).abs() < _pagerSettleEps) {
+      _lastSettledVirtual = nearest.toInt();
+      _swipeTurnSoundFired = false;
+      return;
+    }
+    if (_swipeTurnSoundFired) return;
+    final int from = _lastSettledVirtual ?? _currentVirtualOrNull() ?? 0;
+    _swipeTurnSoundFired = true;
+    _onCurlPageTurnStarted(from, page > from ? from + 1 : from - 1);
+  }
+
   void _onPagerTick() {
-    if (!mounted || !_isPagerSettled) return;
+    if (!mounted) return;
+    if (!_useCurl) _trackSwipeTurnForSound();
+    if (!_isPagerSettled) return;
     // The controller also notifies from inside layout (viewport resize).
     // State may only be touched outside build/layout/paint.
     if (SchedulerBinding.instance.schedulerPhase ==
@@ -1281,6 +1417,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       _dimmingLevel,
       _isDoublePageView,
       _layoutEpoch,
+      _transitionMode,
     );
     if (signature == _curlSignature) return;
     _curlSignature = signature;
@@ -1297,6 +1434,8 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // touch-down capture may even have caught the zoomed look. Give the reset one
   // frame to reach the screen, then wait (bounded) for a fresh capture.
   Future<void> _refreshCurlSnapshotForTurn(int epoch) async {
+    // Swipe mode has no curl layer and therefore no snapshot to refresh.
+    if (!_useCurl) return;
     try {
       await WidgetsBinding.instance.endOfFrame.timeout(
         _frameGuard,
@@ -1513,7 +1652,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
           await _pageController.animateToPage(
             target,
             duration: _slideDuration,
-            curve: Curves.easeInOutCubic,
+            curve: _pageTurnCurve,
           ).timeout(_slideGuard, onTimeout: () {});
         }
       }
@@ -1612,7 +1751,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
             .animateToPage(
               target,
               duration: _slideDuration,
-              curve: Curves.easeInOutCubic,
+              curve: _pageTurnCurve,
             )
             .timeout(_slideGuard, onTimeout: () {});
       }
@@ -1955,6 +2094,57 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     unawaited(_ensureSpreadPanels(layout[v]));
   }
 
+  // Switches between the page curl and the plain horizontal swipe. The two
+  // pagers are different widgets and a ScrollController must never be attached
+  // to two scroll views at once, so each switch gives the new pager a fresh
+  // PageController that opens on the current spread; the old controller is
+  // disposed once its widget has left the tree. Reading position, panel and
+  // zoom are untouched. Ignored while a turn, a drag or a layout switch runs.
+  Future<void> _setTransitionMode(PageTransitionMode mode) async {
+    if (mode == _transitionMode) return;
+    if (_navBusy || _suspendCurlForLayoutSwitch || !_isPagerSettled) return;
+
+    final int lock = _lockNav();
+    PageController? retired;
+    try {
+      final int? virtual = _currentVirtualOrNull();
+      final PageController old = _pageController;
+      _detachPagerListener();
+      _pageController = PageController(initialPage: virtual ?? 0);
+      retired = old;
+      _attachPagerListener();
+      _lastSettledVirtual = virtual;
+      _swipeTurnSoundFired = false;
+
+      setState(() {
+        _transitionMode = mode;
+        
+        // ---> ADD THIS LINE: If curl mode is turned off (switched to swipe), 
+        // automatically turn off the page sound effect.
+        if (mode == PageTransitionMode.swipe) {
+          _pageSoundEnabled = false;
+          _pageTurnSound.setEnabled(false);
+        }
+      });
+      await WidgetsBinding.instance.endOfFrame;
+    } catch (e, st) {
+      debugPrint('Transition switch failed: $e\n$st');
+    } finally {
+      retired?.dispose();
+      _unlockNav(lock);
+    }
+    if (!mounted) return;
+
+    // A freshly built curl layer has no snapshot of the page yet.
+    if (_useCurl) {
+      _curlSnapshotDirty = true;
+      if (_transformationController.value.isIdentity()) {
+        _curlSnapshotTick.value++;
+      }
+    }
+    _onPagerSettled();
+  }
+
   // 3-zone tap handler (left 30%: prev, right 30%: next, center: toggle UI)
   void _handleScreenTap(TapUpDetails details, Size viewportSize) {
     if (_suspendCurlForLayoutSwitch) return;
@@ -2268,320 +2458,70 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
                             _pointerDownAt = null,
                         onPointerCancel: (PointerCancelEvent event) =>
                             _pointerDownAt = null,
-                        child: ComicCurlPageView.builder(
-                        controller: _pageController,
-                        snapshotController: _curlSnapshot,
-                        snapshotInvalidator: _curlSnapshotTick,
-                        enabled: !_suspendCurlForLayoutSwitch,
-                        // Drags that start while a programmatic transition is running are swallowed
-                        isInteractionBlocked: () =>
-                            _navBusy || _suspendCurlForLayoutSwitch,
-                        paperRectBuilder: _curlPaperRect,
-                        leavesBuilder: _curlLeaves,
-                        // A layout-relative index must not change while the
-                        // controller is being remapped to the new layout.
-                        physics: (_isScreenLocked || _suspendCurlForLayoutSwitch)
-                            ? const NeverScrollableScrollPhysics()
-                            : const BouncingScrollPhysics(),
-                        // In spread mode, never show the single-page mirrored
-                        // ghost if a transient geometry lookup misses a leaf.
-                        // A plain paper fallback is preferable to the wrong art.
-                        ghostBackFace: !_isDoublePageView,
-                        backFaceBuilder: (context, virtualIndex) {
-                          if (virtualIndex < 0 ||
-                              virtualIndex >= effectiveLayout.length) {
-                            return const SizedBox.shrink();
-                          }
-                          // This is a static duplicate of the adjacent spread:
-                          // it must not attach the reader's shared zoom
-                          // TransformationController to a second viewer.
-                          return Center(
-                            child: Center(
-                              child: _buildVirtualPageContent(
-                                virtualIndex,
-                                forCurlBackFace: true,
+                        child: _useCurl
+                            ? ComicCurlPageView.builder(
+                                controller: _pageController,
+                                snapshotController: _curlSnapshot,
+                                snapshotInvalidator: _curlSnapshotTick,
+                                enabled: !_suspendCurlForLayoutSwitch,
+                                // Drags that start while a programmatic transition is running are swallowed
+                                isInteractionBlocked: () =>
+                                    _navBusy || _suspendCurlForLayoutSwitch,
+                                paperRectBuilder: _curlPaperRect,
+                                leavesBuilder: _curlLeaves,
+                                // A layout-relative index must not change while the
+                                // controller is being remapped to the new layout.
+                                physics: _pagerPhysics,
+                                // In spread mode, never show the single-page mirrored
+                                // ghost if a transient geometry lookup misses a leaf.
+                                // A plain paper fallback is preferable to the wrong art.
+                                ghostBackFace: !_isDoublePageView,
+                                backFaceBuilder: (context, virtualIndex) {
+                                  if (virtualIndex < 0 ||
+                                      virtualIndex >= effectiveLayout.length) {
+                                    return const SizedBox.shrink();
+                                  }
+                                  // This is a static duplicate of the adjacent spread:
+                                  // it must not attach the reader's shared zoom
+                                  // TransformationController to a second viewer.
+                                  return Center(
+                                    child: Center(
+                                      child: _buildVirtualPageContent(
+                                        virtualIndex,
+                                        forCurlBackFace: true,
+                                      ),
+                                    ),
+                                  );
+                                },
+                                itemCount: effectiveLayout.length,
+                                onPageTurnStarted: _onCurlPageTurnStarted,
+                                onPageChanged: _onPagerPageChanged,
+                                itemBuilder: (context, virtualIndex) =>
+                                    _buildPagerItem(virtualIndex, zoomOwner),
+                              )
+                            // Plain horizontal slide: same controller type, same
+                            // physics, same page content and zoom ownership.
+                            : PageView.builder(
+                                controller: _pageController,
+                                physics: _pagerPhysics,
+                                itemCount: effectiveLayout.length,
+                                onPageChanged: _onPagerPageChanged,
+                                itemBuilder: (context, virtualIndex) =>
+                                    _buildPagerItem(virtualIndex, zoomOwner),
                               ),
-                            ),
-                          );
-                        },
-                        itemCount: effectiveLayout.length,
-                        onPageTurnStarted: _onCurlPageTurnStarted,
-                        onPageChanged: (virtualIndex) {
-                          // Programmatic navigation and layout remapping already
-                          // own the reader state; ignore transient indices.
-                          if (_navBusy || _suspendCurlForLayoutSwitch) return;
-                          if (_findVirtualPageIndex(_currentPage) ==
-                              virtualIndex)
-                            return;
-                          _arriveBySwipe(virtualIndex);
-                        },
-                        itemBuilder: (context, virtualIndex) {
-                          // Only the interactive foreground page owns the shared
-                          // controller. The backFaceBuilder above renders a
-                          // separate static copy without an InteractiveViewer.
-                          final TransformationController? controller =
-                              virtualIndex == zoomOwner
-                                  ? _transformationController
-                                  : null;
-                          final Key key = ValueKey(
-                            '${_isDoublePageView ? 'd' : 's'}$virtualIndex',
-                          );
-                          return Center(
-                            child: InteractiveViewer(
-                              key: key,
-                              transformationController: controller,
-                              minScale: 1.0,
-                              maxScale: 5.0,
-                              child: Center(
-                                child: _buildVirtualPageContent(virtualIndex),
-                              ),
-                            ),
-                          );
-                        },
-                      ),
                       ),
                     ),
                     Positioned(
                       top: 0,
                       left: 0,
                       right: 0,
-                      child: IgnorePointer(
-                        ignoring: !_showUI,
-                        child: AnimatedSlide(
-                          offset: _showUI ? Offset.zero : const Offset(0, -1),
-                          duration: const Duration(milliseconds: 220),
-                          curve: Curves.easeInOut,
-                          child: AnimatedOpacity(
-                            opacity: _showUI ? 1.0 : 0.0,
-                            duration: const Duration(milliseconds: 200),
-                            child: AppBar(
-                            backgroundColor: Colors.black.withValues(
-                              alpha: 0.8,
-                            ),
-                            title: Text(
-                              'PanelShift Reader (${_currentPage + 1}/$_pageCount)',
-                              style: const TextStyle(color: Colors.white),
-                            ),
-                            iconTheme: const IconThemeData(color: Colors.white),
-
-                            actions: [
-                              IconButton(
-                                icon: Icon(
-                                  _isScreenLocked
-                                      ? Icons.lock
-                                      : Icons.lock_open,
-                                ),
-                                tooltip: _isScreenLocked
-                                    ? 'Screen Locked'
-                                    : 'Screen Unlocked',
-                                onPressed: () {
-                                  setState(() {
-                                    _isScreenLocked = !_isScreenLocked;
-                                  });
-                                },
-                              ),
-                              IconButton(
-                                icon: Icon(
-                                  _pageSoundEnabled
-                                      ? Icons.volume_up
-                                      : Icons.volume_off,
-                                ),
-                                tooltip: 'Page Sound',
-                                onPressed: _showPageSoundDialog,
-                              ),
-                              IconButton(
-                                icon: const Icon(Icons.brightness_6),
-                                tooltip: 'Adjust Dimming Level',
-                                onPressed: _showDimmingDialog,
-                              ),
-                              IconButton(
-                                icon: Icon(
-                                  _fullPageStepMode == FullPageStepMode.none
-                                      ? Icons.fullscreen_exit
-                                      : _fullPageStepMode ==
-                                            FullPageStepMode.afterLast
-                                      ? Icons.vertical_align_bottom
-                                      : _fullPageStepMode ==
-                                            FullPageStepMode.beforeFirst
-                                      ? Icons.vertical_align_top
-                                      : Icons.unfold_more,
-                                ),
-                                tooltip:
-                                    'Full-Page Step: ${_fullPageStepMode.name}',
-                                onPressed: () {
-                                  setState(() {
-                                    switch (_fullPageStepMode) {
-                                      case FullPageStepMode.none:
-                                        _fullPageStepMode =
-                                            FullPageStepMode.afterLast;
-                                        break;
-                                      case FullPageStepMode.afterLast:
-                                        _fullPageStepMode =
-                                            FullPageStepMode.beforeFirst;
-                                        break;
-                                      case FullPageStepMode.beforeFirst:
-                                        _fullPageStepMode =
-                                            FullPageStepMode.both;
-                                        break;
-                                      case FullPageStepMode.both:
-                                        _fullPageStepMode =
-                                            FullPageStepMode.none;
-                                        break;
-                                    }
-                                  });
-                                },
-                              ),
-                              IconButton(
-                                icon: Icon(
-                                  _isDoublePageView
-                                      ? Icons.menu_book
-                                      : Icons.chrome_reader_mode,
-                                ),
-                                tooltip: _layoutReady
-                                    ? 'Toggle Spread View'
-                                    : 'Preparing spread layout',
-                                // Spreads need every page's size, which is measured in
-                                // the background right after the first frame.
-                                onPressed: _layoutReady
-                                    ? _toggleSpreadView
-                                    : null,
-                              ),
-                              IconButton(
-                                icon: Icon(
-                                  _showPanelOutlines
-                                      ? Icons.border_outer
-                                      : Icons.border_clear,
-                                ),
-                                tooltip: 'Toggle Panel Outlines & Numbers',
-                                onPressed: () {
-                                  setState(() {
-                                    _showPanelOutlines = !_showPanelOutlines;
-                                  });
-                                },
-                              ),
-                              IconButton(
-                                icon: Icon(
-                                  _showPanelOverlays
-                                      ? Icons.layers
-                                      : Icons.layers_outlined,
-                                ),
-                                tooltip: 'Toggle Panel Dimming',
-                                onPressed: () {
-                                  setState(() {
-                                    _showPanelOverlays = !_showPanelOverlays;
-                                  });
-                                },
-                              ),
-                            ],
-                            ),
-                          ),
-                        ),
-                      ),
+                      child: _buildHeader(),
                     ),
                     Positioned(
                       left: 0,
                       right: 0,
                       bottom: 0,
-                      child: IgnorePointer(
-                        ignoring: !_showUI,
-                        child: AnimatedSlide(
-                          offset: _showUI ? Offset.zero : const Offset(0, 1),
-                          duration: const Duration(milliseconds: 220),
-                          curve: Curves.easeInOut,
-                          child: AnimatedOpacity(
-                            opacity: _showUI ? 1.0 : 0.0,
-                            duration: const Duration(milliseconds: 200),
-                            child: GestureDetector(
-                              behavior: HitTestBehavior.opaque,
-                              // Absorb taps/drags at the overlay boundary; the
-                              // slider below owns its horizontal drag gesture.
-                              onTap: () {},
-                              child: SafeArea(
-                                top: false,
-                                child: Container(
-                                  padding: const EdgeInsets.fromLTRB(18, 10, 18, 8),
-                                  decoration: BoxDecoration(
-                                    color: Colors.black.withValues(alpha: 0.82),
-                                    border: Border(
-                                      top: BorderSide(
-                                        color: Colors.white.withValues(alpha: 0.12),
-                                      ),
-                                    ),
-                                  ),
-                                  child: ValueListenableBuilder<double>(
-                                    valueListenable: _footerPageValue,
-                                    builder: (context, scrubValue, _) {
-                                      final double displayedPage = _isFooterScrubbing
-                                          ? scrubValue
-                                          : (_currentPage + 1).toDouble();
-                                      final int pageCount = math.max(1, _pageCount).toInt();
-                                      final double sliderValue = displayedPage
-                                          .clamp(1.0, pageCount.toDouble());
-                                      return Column(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Row(
-                                            children: [
-                                              const Icon(Icons.menu_book, color: Colors.white70, size: 17),
-                                              const SizedBox(width: 8),
-                                              Text(
-                                                'Page ${sliderValue.round()} of $_pageCount',
-                                                style: const TextStyle(
-                                                  color: Colors.white,
-                                                  fontSize: 13,
-                                                  fontWeight: FontWeight.w600,
-                                                ),
-                                              ),
-                                              const Spacer(),
-                                              Text(
-                                                _isDoublePageView ? 'Double page' : 'Single page',
-                                                style: TextStyle(
-                                                  color: Colors.white.withValues(alpha: 0.55),
-                                                  fontSize: 11,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                          SliderTheme(
-                                            data: SliderTheme.of(context).copyWith(
-                                              trackHeight: 3,
-                                              activeTrackColor: Colors.white,
-                                              inactiveTrackColor: Colors.white24,
-                                              thumbColor: Colors.white,
-                                              overlayColor: Colors.white.withValues(alpha: 0.12),
-                                              valueIndicatorColor: Colors.black87,
-                                              valueIndicatorTextStyle: const TextStyle(color: Colors.white),
-                                            ),
-                                            child: Slider(
-                                              min: 1,
-                                              max: math.max(1, _pageCount).toDouble(),
-                                              divisions: _pageCount > 1 ? _pageCount - 1 : null,
-                                              value: sliderValue,
-                                              label: 'Page ${sliderValue.round()}',
-                                              onChangeStart: _pageCount <= 1 ? null : (value) {
-                                                _isFooterScrubbing = true;
-                                                _footerPageValue.value = value;
-                                              },
-                                              onChanged: _pageCount <= 1 ? null : (value) {
-                                                _footerPageValue.value = value;
-                                              },
-                                              onChangeEnd: _pageCount <= 1 ? null : (value) {
-                                                _isFooterScrubbing = false;
-                                                _footerPageValue.value = value;
-                                                unawaited(_jumpToPhysicalPage(value.round() - 1));
-                                              },
-                                            ),
-                                          ),
-                                        ],
-                                      );
-                                    },
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
+                      child: _buildBottomBar(),
                     ),
                   ],
                 );
@@ -2589,6 +2529,387 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
             ),
       ),
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pager helpers shared by the page curl and the horizontal swipe
+  // ---------------------------------------------------------------------------
+
+  ScrollPhysics get _pagerPhysics =>
+      (_isScreenLocked || _suspendCurlForLayoutSwitch)
+      ? const NeverScrollableScrollPhysics()
+      : const BouncingScrollPhysics();
+
+  void _onPagerPageChanged(int virtualIndex) {
+    // Programmatic navigation and layout remapping already own the reader
+    // state; ignore transient indices.
+    if (_navBusy || _suspendCurlForLayoutSwitch) return;
+    if (_findVirtualPageIndex(_currentPage) == virtualIndex) return;
+    _arriveBySwipe(virtualIndex);
+  }
+
+  Widget _buildPagerItem(int virtualIndex, int zoomOwner) {
+    // Only the interactive foreground page owns the shared controller. The
+    // curl's backFaceBuilder renders a separate static copy without an
+    // InteractiveViewer.
+    final TransformationController? controller = virtualIndex == zoomOwner
+        ? _transformationController
+        : null;
+    final Key key = ValueKey('${_isDoublePageView ? 'd' : 's'}$virtualIndex');
+    return Center(
+      child: InteractiveViewer(
+        key: key,
+        transformationController: controller,
+        minScale: 1.0,
+        maxScale: 5.0,
+        child: Center(child: _buildVirtualPageContent(virtualIndex)),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Header (title only) and bottom control hub
+  // ---------------------------------------------------------------------------
+
+  // The comic's name without its file extension (Batman_01.cbz -> Batman_01).
+  // If ComicIdentity carries a name or file name, use it as the fallback here:
+  //   _comicDisplayTitle(widget.title ?? widget.comic?.<field>)
+  String get _headerTitle {
+    final String name = _comicDisplayTitle(widget.title);
+    return name.isEmpty ? 'PanelShift Reader' : name;
+  }
+
+  Widget _buildHeader() {
+    return IgnorePointer(
+      ignoring: !_showUI,
+      child: AnimatedSlide(
+        offset: _showUI ? Offset.zero : const Offset(0, -1),
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeInOut,
+        child: AnimatedOpacity(
+          opacity: _showUI ? 1.0 : 0.0,
+          duration: const Duration(milliseconds: 200),
+          // Text only: every action lives in the bottom control hub. The
+          // standard back arrow is kept; set automaticallyImplyLeading to
+          // false for a purely text header (system back still works).
+          child: AppBar(
+            backgroundColor: Colors.black.withValues(alpha: 0.8),
+            iconTheme: const IconThemeData(color: Colors.white),
+            title: Text(
+              _headerTitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBottomBar() {
+    return IgnorePointer(
+      ignoring: !_showUI,
+      child: AnimatedSlide(
+        offset: _showUI ? Offset.zero : const Offset(0, 1),
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeInOut,
+        child: AnimatedOpacity(
+          opacity: _showUI ? 1.0 : 0.0,
+          duration: const Duration(milliseconds: 200),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            // Absorb taps/drags at the overlay boundary; the slider below owns
+            // its horizontal drag gesture.
+            onTap: () {},
+            child: SafeArea(
+              top: false,
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.82),
+                  border: Border(
+                    top: BorderSide(color: Colors.white.withValues(alpha: 0.12)),
+                  ),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _buildPageSlider(),
+                    const SizedBox(height: 2),
+                    Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 560),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _buildPrimaryControls(),
+                            // Secondary row: expands above the page edge of the
+                            // bar so the slider never moves.
+                            AnimatedSize(
+                              duration: const Duration(milliseconds: 200),
+                              curve: Curves.easeInOut,
+                              alignment: Alignment.topCenter,
+                              child: _showMoreControls
+                                  ? Column(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Divider(
+                                          height: 8,
+                                          thickness: 1,
+                                          color: Colors.white.withValues(
+                                            alpha: 0.12,
+                                          ),
+                                        ),
+                                        _buildSecondaryControls(),
+                                      ],
+                                    )
+                                  : const SizedBox(width: double.infinity),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Page counter + slider. Has its own notifier so scrubbing rebuilds only
+  // this part of the bar, not the comic pages or the control buttons.
+  Widget _buildPageSlider() {
+    return ValueListenableBuilder<double>(
+      valueListenable: _footerPageValue,
+      builder: (context, scrubValue, _) {
+        final double displayedPage = _isFooterScrubbing
+            ? scrubValue
+            : (_currentPage + 1).toDouble();
+        final int pageCount = math.max(1, _pageCount).toInt();
+        final double sliderValue = displayedPage.clamp(
+          1.0,
+          pageCount.toDouble(),
+        );
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              child: Row(
+                children: [
+                  const Icon(Icons.menu_book, color: Colors.white70, size: 17),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Page ${sliderValue.round()} of $_pageCount',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    _isDoublePageView ? 'Double page' : 'Single page',
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.55),
+                      fontSize: 11,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 3,
+                activeTrackColor: Colors.white,
+                inactiveTrackColor: Colors.white24,
+                thumbColor: Colors.white,
+                overlayColor: Colors.white.withValues(alpha: 0.12),
+                valueIndicatorColor: Colors.black87,
+                valueIndicatorTextStyle: const TextStyle(color: Colors.white),
+              ),
+              child: Slider(
+                min: 1,
+                max: math.max(1, _pageCount).toDouble(),
+                divisions: _pageCount > 1 ? _pageCount - 1 : null,
+                value: sliderValue,
+                label: 'Page ${sliderValue.round()}',
+                onChangeStart: _pageCount <= 1
+                    ? null
+                    : (value) {
+                        _isFooterScrubbing = true;
+                        _footerPageValue.value = value;
+                      },
+                onChanged: _pageCount <= 1
+                    ? null
+                    : (value) {
+                        _footerPageValue.value = value;
+                      },
+                onChangeEnd: _pageCount <= 1
+                    ? null
+                    : (value) {
+                        _isFooterScrubbing = false;
+                        _footerPageValue.value = value;
+                        unawaited(_jumpToPhysicalPage(value.round() - 1));
+                      },
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Everyday toggles: one tap flips them.
+  Widget _buildPrimaryControls() {
+    return Row(
+      children: [
+        Expanded(
+          child: _HubButton(
+            icon: _isScreenLocked ? Icons.lock : Icons.lock_open,
+            label: _isScreenLocked ? 'Locked' : 'Unlocked',
+            tooltip: _isScreenLocked
+                ? 'Screen locked (swiping disabled)'
+                : 'Screen unlocked (swiping enabled)',
+            active: _isScreenLocked,
+            onPressed: () => setState(() => _isScreenLocked = !_isScreenLocked),
+          ),
+        ),
+        Expanded(
+          child: _HubButton(
+            icon: _isDoublePageView
+                ? Icons.menu_book
+                : Icons.chrome_reader_mode,
+            label: _isDoublePageView ? 'Double' : 'Single',
+            tooltip: _layoutReady
+                ? 'Toggle single / double page view'
+                : 'Preparing spread layout',
+            active: _isDoublePageView,
+            // Spreads need every page's size, which is measured in the
+            // background right after the first frame.
+            onPressed: _layoutReady ? _toggleSpreadView : null,
+          ),
+        ),
+        Expanded(
+          child: _HubButton(
+            icon: _showPanelOutlines ? Icons.border_outer : Icons.border_clear,
+            label: 'Outlines',
+            tooltip: 'Toggle panel outlines & numbers',
+            active: _showPanelOutlines,
+            onPressed: () =>
+                setState(() => _showPanelOutlines = !_showPanelOutlines),
+          ),
+        ),
+        Expanded(
+          child: _HubButton(
+            icon: _showPanelOverlays ? Icons.layers : Icons.layers_outlined,
+            label: 'Panel dim',
+            tooltip: 'Toggle panel dimming',
+            active: _showPanelOverlays,
+            onPressed: () =>
+                setState(() => _showPanelOverlays = !_showPanelOverlays),
+          ),
+        ),
+        Expanded(
+          child: _HubButton(
+            icon: _useCurl ? Icons.auto_stories : Icons.swipe,
+            label: _useCurl ? 'Curl' : 'Swipe',
+            tooltip: _useCurl
+                ? 'Page curl (tap for horizontal swipe)'
+                : 'Horizontal swipe (tap for page curl)',
+            onPressed: () => unawaited(
+              _setTransitionMode(
+                _useCurl ? PageTransitionMode.swipe : PageTransitionMode.curl,
+              ),
+            ),
+          ),
+        ),
+        Expanded(
+          child: _HubButton(
+            icon: _showMoreControls ? Icons.expand_more : Icons.expand_less,
+            label: _showMoreControls ? 'Less' : 'More',
+            tooltip: _showMoreControls
+                ? 'Hide extra controls'
+                : 'Sound, dimming, full-page step, speed',
+            active: _showMoreControls,
+            onPressed: () =>
+                setState(() => _showMoreControls = !_showMoreControls),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // Settings that open a dialog or cycle through several states.
+  Widget _buildSecondaryControls() {
+    return Row(
+      children: [
+        Expanded(
+          child: _HubButton(
+            icon: _pageSoundEnabled ? Icons.volume_up : Icons.volume_off,
+            label: 'Sound',
+            tooltip: 'Page sound',
+            active: _pageSoundEnabled,
+            onPressed: _showPageSoundDialog,
+          ),
+        ),
+        Expanded(
+          child: _HubButton(
+            icon: Icons.brightness_6,
+            label: 'Dim ${(_dimmingLevel * 100).round()}%',
+            tooltip: 'Adjust dimming level',
+            onPressed: _showDimmingDialog,
+          ),
+        ),
+        Expanded(
+          child: _HubButton(
+            icon: switch (_fullPageStepMode) {
+              FullPageStepMode.none => Icons.fullscreen_exit,
+              FullPageStepMode.afterLast => Icons.vertical_align_bottom,
+              FullPageStepMode.beforeFirst => Icons.vertical_align_top,
+              FullPageStepMode.both => Icons.unfold_more,
+            },
+            label: switch (_fullPageStepMode) {
+              FullPageStepMode.none => 'Full: Off',
+              FullPageStepMode.afterLast => 'Full: After',
+              FullPageStepMode.beforeFirst => 'Full: Before',
+              FullPageStepMode.both => 'Full: Both',
+            },
+            tooltip: 'Full-page step: ${_fullPageStepMode.name}',
+            active: _fullPageStepMode != FullPageStepMode.none,
+            onPressed: _cycleFullPageStepMode,
+          ),
+        ),
+        Expanded(
+          child: _HubButton(
+            icon: Icons.speed,
+            label: 'Speed ${_formatSpeed(_pageTurnSpeed)}',
+            tooltip: 'Page-turn speed',
+            active: _pageTurnSpeed != 1.0,
+            onPressed: _showTurnSpeedDialog,
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _cycleFullPageStepMode() {
+    setState(() {
+      _fullPageStepMode = switch (_fullPageStepMode) {
+        FullPageStepMode.none => FullPageStepMode.afterLast,
+        FullPageStepMode.afterLast => FullPageStepMode.beforeFirst,
+        FullPageStepMode.beforeFirst => FullPageStepMode.both,
+        FullPageStepMode.both => FullPageStepMode.none,
+      };
+    });
   }
 
   // Content for a layout-relative PageView item. The regular item is wrapped
@@ -2785,6 +3106,66 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
             _currentPage != page)
           Container(color: Colors.black.withValues(alpha: 0.65)),
       ],
+    );
+  }
+}
+
+// One control of the bottom hub: icon over a short caption. Highlighted while
+// the feature it controls is on; greyed out when it has no action.
+class _HubButton extends StatelessWidget {
+  const _HubButton({
+    required this.icon,
+    required this.label,
+    required this.tooltip,
+    required this.onPressed,
+    this.active = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final String tooltip;
+  final VoidCallback? onPressed;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool enabled = onPressed != null;
+    final Color color = !enabled
+        ? Colors.white30
+        : (active ? Colors.white : Colors.white70);
+    return Tooltip(
+      message: tooltip,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        child: Material(
+          color: active ? Colors.white.withValues(alpha: 0.14) : Colors.transparent,
+          borderRadius: BorderRadius.circular(10),
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onPressed,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(icon, size: 22, color: color),
+                  const SizedBox(height: 2),
+                  Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: color,
+                      fontSize: 10.5,
+                      fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
