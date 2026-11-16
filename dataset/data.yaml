@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['comic_panel']
+
+roboflow:
+  workspace: morstudio
+  project: comic-panels-detection-r23lk
+  version: 3
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/morstudio/comic-panels-detection-r23lk/dataset/3
