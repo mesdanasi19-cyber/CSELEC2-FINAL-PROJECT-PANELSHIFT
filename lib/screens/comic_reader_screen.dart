@@ -3,6 +3,7 @@ import 'dart:isolate';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/physics.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 
@@ -26,6 +27,43 @@ enum FullPagePosition { none, beforeFirst, afterLast }
 
 // How pages change: the custom page curl, or a plain horizontal PageView slide
 enum PageTransitionMode { curl, swipe }
+
+/// Page-snapping physics for the reader's pager (curl and swipe).
+///
+/// Identical to the framework's [PageScrollPhysics] except for a stiffer settle
+/// spring. The framework default (mass 0.5, stiffness 100, damping ratio 1.1)
+/// takes roughly 0.3 s to finish a released page; stiffness 150 at ratio 1.05
+/// settles in roughly 20% less time while staying (near-)critically damped, so
+/// it never overshoots a page boundary. A released swipe feels a beat more
+/// immediate, and the curl - the most expensive thing the app draws - is on
+/// screen for that much fewer frames. Fling thresholds are left at the platform
+/// defaults, where any deliberate flick already turns the page.
+class _ReaderPagerPhysics extends PageScrollPhysics {
+  const _ReaderPagerPhysics({super.parent});
+
+  static final SpringDescription _spring = SpringDescription.withDampingRatio(
+    mass: 0.5,
+    stiffness: 150.0,
+    ratio: 1.05,
+  );
+
+  @override
+  _ReaderPagerPhysics applyTo(ScrollPhysics? ancestor) =>
+      _ReaderPagerPhysics(parent: buildParent(ancestor));
+
+  @override
+  SpringDescription get spring => _spring;
+}
+
+/// The bitmap provider currently handed out for one page, remembered with the
+/// inputs it was built from (see _ComicReaderScreenState._pageImageProvider).
+class _PageProvider {
+  const _PageProvider(this.bytes, this.size, this.provider);
+
+  final Uint8List bytes;
+  final Size? size;
+  final ImageProvider provider;
+}
 
 // Header title: strips the folder and any trailing archive/document extension
 // (Batman_01.cbz -> Batman_01). Only known comic/archive types are removed, so
@@ -201,6 +239,11 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   );
   late final TransformationController _transformationController;
   late final AnimationController _animationController;
+  // One curve for every zoom animation. A CurvedAnimation registers a status
+  // listener on its parent for as long as it lives, so creating a new one per
+  // panel tap (as before) grew the controller's listener list for the whole
+  // reading session. Only the tween changes between animations.
+  late final CurvedAnimation _zoomCurve;
   Animation<Matrix4>? _zoomAnimation;
 
   // Caches for detected panels and original image dimensions per physical page
@@ -238,10 +281,28 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // the animation keeps running past it, and anything that needs a settled
   // pager is parked until then (_focusOnPanel / _resetZoomInstant).
   static const Duration _baseSlideGuard = Duration(milliseconds: 540);
-  static const Duration _frameGuard = Duration(milliseconds: 120);
-  // Extra time the navigation watchdog allows beyond the slide guard (covers
-  // the short wait for a fresh curl snapshot, see _refreshCurlSnapshotForTurn).
-  static const Duration _navLockSlack = Duration(milliseconds: 300);
+  // Frame / snapshot waits, in milliseconds so the watchdog slack below can be
+  // derived from them at compile time. These are SAFETY NETS, not delays: on a
+  // healthy device each wait ends after one frame (~16 ms). They only matter
+  // when a frame is late - a 60 Hz low-end GPU re-rasterising a big page, a
+  // cold shader - and then they decide whether the next step (capturing the
+  // curl snapshot, starting the slide) sees the zoom reset that was just
+  // applied, or runs against a stale frame. 120 ms is only ~7 frames at 60 Hz,
+  // which one slow raster of a full-resolution page can eat on its own.
+  static const int _frameGuardMs = 200;
+  static const int _snapshotRefreshTimeoutMs = 260;
+  static const Duration _frameGuard = Duration(milliseconds: _frameGuardMs);
+  static const Duration _snapshotRefreshTimeout = Duration(
+    milliseconds: _snapshotRefreshTimeoutMs,
+  );
+  // Extra time the navigation watchdog allows beyond the slide guard. The worst
+  // case before a slide can start is two frame guards (the footer jump waits
+  // one frame itself, then _refreshCurlSnapshotForTurn waits another) plus the
+  // snapshot wait, plus a margin. Derived, so retuning a guard cannot silently
+  // break the invariant "the watchdog outlasts the waits it protects".
+  static const Duration _navLockSlack = Duration(
+    milliseconds: 2 * _frameGuardMs + _snapshotRefreshTimeoutMs + 140,
+  );
   // Gentler than the old easeInOutCubic: slower start and stop.
   static const Curve _pageTurnCurve = Curves.easeInOutSine;
 
@@ -338,6 +399,33 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   _DeferredZoom? _deferredZoom;
   Offset? _pointerDownAt;
   static const double _zoomFastForwardSlop = 9.0;
+
+  // --- Instant edge taps --------------------------------------------------------
+  // GestureDetector reports onTapUp only after its double-tap recogniser has
+  // given up (kDoubleTapTimeout, 300 ms). With onDoubleTapDown registered,
+  // EVERY tap - including the rapid left/right taps that step through panels -
+  // therefore arrives 300 ms late. Edge-zone taps are recognised here instead,
+  // on finger-up, straight from the pointer stream: zero added latency. The
+  // centre zone keeps GestureDetector's tap / double-tap arbitration, so
+  // double-tap-to-zoom (and the single tap that toggles the UI) work as before.
+  // Trade-off: a quick double tap inside an edge zone now steps twice instead
+  // of zooming. Set to false to restore the original behaviour everywhere.
+  static const bool _kInstantEdgeTaps = true;
+  static const double _kEdgeZoneLeft = 0.3;
+  static const double _kEdgeZoneRight = 0.7;
+  // The platform touch slop (8 dp on Android): beyond it the PageView's drag
+  // recogniser has taken the gesture, so it must not also count as a tap.
+  static const double _kTapMoveSlop = 8.0;
+  // GestureDetector has no upper bound either; this only filters out a finger
+  // that was parked on the screen and forgotten.
+  static const Duration _kTapMaxDuration = Duration(seconds: 2);
+  final Set<int> _downPointers = <int>{};
+  int? _tapPointer;
+  Offset? _tapDownLocal;
+  Duration? _tapDownTime;
+
+  // Refreshes the curl snapshot once a zoom has settled (see _noteZoomSettled).
+  Timer? _zoomSnapshotTimer;
 
   // The slider has its own notifier so pointer-move updates rebuild only the
   // footer, not the comic pages or their image/panel widgets.
@@ -481,7 +569,14 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
             if (_zoomAnimation != null) {
               _transformationController.value = _zoomAnimation!.value;
             }
+          })
+          ..addStatusListener((AnimationStatus status) {
+            if (status == AnimationStatus.completed) _noteZoomSettled();
           });
+    _zoomCurve = CurvedAnimation(
+      parent: _animationController,
+      curve: Curves.easeInOutCubic,
+    );
 
     for (int i = 0; i < _pageCount; i++) {
       _singleLayout.add([i]);
@@ -518,10 +613,13 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     }
     _prefetchTimer?.cancel();
     _navWatchdog?.cancel();
+    _zoomSnapshotTimer?.cancel();
     PanelDetectionService.instance.cancelAll();
     _pageBytes.clear();
+    _pageProviders.clear();
     _deferredZoom = null;
     _detachPagerListener();
+    _zoomCurve.dispose();
     _animationController.dispose();
     _transformationController.removeListener(_onZoomChanged);
     _transformationController.dispose();
@@ -855,16 +953,80 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     }
   }
 
+  // --- Page bitmap budget ------------------------------------------------------
+  // A comic scan is often far larger than the screen (a 3000 x 4500 JPEG is
+  // 54 MB once decoded to RGBA) and the resident window keeps up to three
+  // spreads decoded in the ImageCache at once. Decoding every page at full
+  // resolution is the app's largest memory consumer and the usual cause of
+  // out-of-memory kills on 3-4 GB phones. Pages are therefore decoded at no
+  // more than [_kMaxDecodedPagePixels] pixels (~24 MB) and
+  // [_kMaxDecodedPageSide] on the long side. Panel detection (it reads the
+  // original bytes) and the panel rectangles (normalised coordinates) are
+  // unaffected, zoom stays sharp up to roughly twice the full-screen scale for
+  // typical scans, and a page at or under the budget is not resized at all.
+  // Every site that touches a page's bitmap (build, precache, evict) must go
+  // through [_pageImageProvider]: the ImageCache key depends on the target size.
+  static const int _kMaxDecodedPagePixels = 6 * 1024 * 1024;
+  static const int _kMaxDecodedPageSide = 4096;
+
+  // The provider handed to an Image widget must be the SAME instance while the
+  // bytes and the measured size are unchanged: ResizeImage has no value
+  // equality (MemoryImage has), so a fresh instance on every build would make
+  // every Image re-resolve its stream on every rebuild of the reader.
+  final Map<int, _PageProvider> _pageProviders = <int, _PageProvider>{};
+
+  ImageProvider _pageImageProvider(int page, Uint8List bytes) {
+    final Size? size = _imageSizesCache[page];
+    final _PageProvider? cached = _pageProviders[page];
+    if (cached != null &&
+        identical(cached.bytes, bytes) &&
+        cached.size == size) {
+      return cached.provider;
+    }
+    final ImageProvider provider = _boundedPageProvider(bytes, size);
+    _pageProviders[page] = _PageProvider(bytes, size, provider);
+    return provider;
+  }
+
+  ImageProvider _boundedPageProvider(Uint8List bytes, Size? size) {
+    final ImageProvider source = MemoryImage(bytes);
+    if (size == null || size.width <= 0 || size.height <= 0) return source;
+
+    final double scale = math.min(
+      1.0,
+      math.min(
+        math.sqrt(_kMaxDecodedPagePixels / (size.width * size.height)),
+        _kMaxDecodedPageSide / math.max(size.width, size.height),
+      ),
+    );
+    if (scale >= 1.0) return source;
+
+    return ResizeImage(
+      source,
+      width: math.max(1, (size.width * scale).floor()),
+      height: math.max(1, (size.height * scale).floor()),
+      policy: ResizeImagePolicy.fit,
+    );
+  }
+
   // Loads [pages] (current page first) and instantiates their image codecs
   // now, in the engine's background threads, so a page turn finds the decoded
-  // image already in the ImageCache.
+  // image already in the ImageCache. A newer call supersedes an older one: when
+  // the user flips through pages quickly, the stale windows stop at their next
+  // page instead of piling decode work (and decoded bitmaps) on top of the
+  // current one.
+  int _warmGeneration = 0;
+
   Future<void> _warmWindow(List<int> pages) async {
+    final int generation = ++_warmGeneration;
     for (final int page in pages) {
+      if (generation != _warmGeneration) return;
       try {
         await _ensurePageLoaded(page);
+        if (generation != _warmGeneration) return;
         final Uint8List? bytes = _pageBytes[page];
         if (!mounted || bytes == null) continue;
-        await precacheImage(MemoryImage(bytes), context);
+        await precacheImage(_pageImageProvider(page, bytes), context);
       } catch (e) {
         debugPrint('Could not warm up page $page: $e');
       }
@@ -881,7 +1043,8 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
         .toList();
     for (final int page in far) {
       final Uint8List? bytes = _pageBytes.remove(page);
-      if (bytes != null) unawaited(MemoryImage(bytes).evict());
+      if (bytes != null) unawaited(_pageImageProvider(page, bytes).evict());
+      _pageProviders.remove(page); // must not keep the bytes alive
     }
   }
 
@@ -974,12 +1137,27 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     _doubleLayout = layout;
   }
 
-  // Active layout (null placeholders removed)
+  // Active layout (null placeholders removed). The compacted double layout is
+  // built once per assignment of _doubleLayout instead of on every call: this
+  // getter sits on the build path, the tap handlers and the per-frame curl
+  // callbacks, and allocating a list per spread (~150 for a 300-page comic) each
+  // time is pure garbage. Callers only read the result.
+  List<List<int>>? _compactDoubleLayout;
+  List<List<int?>>? _compactDoubleLayoutSource;
+
   List<List<int>> _getEffectiveLayout() {
     if (_isDoublePageView) {
-      return _doubleLayout
+      final List<List<int?>> source = _doubleLayout;
+      final List<List<int>>? cached = _compactDoubleLayout;
+      if (cached != null && identical(_compactDoubleLayoutSource, source)) {
+        return cached;
+      }
+      final List<List<int>> compact = source
           .map((spread) => spread.whereType<int>().toList())
           .toList();
+      _compactDoubleLayoutSource = source;
+      _compactDoubleLayout = compact;
+      return compact;
     }
     return _singleLayout;
   }
@@ -1444,7 +1622,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       if (!mounted || epoch != _layoutEpoch || _suspendCurlForLayoutSwitch) {
         return;
       }
-      await _curlSnapshot.refresh();
+      await _curlSnapshot.refresh(timeout: _snapshotRefreshTimeout);
       _curlSnapshotDirty = false;
     } catch (e, st) {
       debugPrint('Curl snapshot refresh failed: $e\n$st');
@@ -1456,6 +1634,12 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // page all agree on the final zoom. Taps are not affected (a tap never moves
   // far enough), so rapid panel tapping keeps its smooth retargeting.
   void _onReaderPointerMove(PointerMoveEvent event) {
+    final Offset? tapOrigin = _tapDownLocal;
+    if (_tapPointer == event.pointer &&
+        tapOrigin != null &&
+        (event.localPosition - tapOrigin).distance > _kTapMoveSlop) {
+      _tapPointer = null; // it is a drag, not a tap
+    }
     final Offset? origin = _pointerDownAt;
     if (origin == null || !_animationController.isAnimating) return;
     if ((event.position - origin).distance < _zoomFastForwardSlop) return;
@@ -1463,6 +1647,68 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     _pointerDownAt = null;
     _animationController.value = 1.0;
     _curlSnapshotTick.value++;
+  }
+
+  void _onReaderPointerDown(PointerDownEvent event) {
+    _pointerDownAt = event.position;
+    _downPointers.add(event.pointer);
+    if (_downPointers.length == 1) {
+      _tapPointer = event.pointer;
+      _tapDownLocal = event.localPosition;
+      _tapDownTime = event.timeStamp;
+    } else {
+      _tapPointer = null; // a second finger: pinch or catch, not a tap
+    }
+  }
+
+  // Edge-zone taps fire here, on finger-up (see _kInstantEdgeTaps).
+  void _onReaderPointerUp(PointerUpEvent event, Size viewportSize) {
+    _pointerDownAt = null;
+    _downPointers.remove(event.pointer);
+    final Duration? downTime = _tapDownTime;
+    final bool isTap =
+        _kInstantEdgeTaps &&
+        _tapPointer == event.pointer &&
+        downTime != null &&
+        event.timeStamp - downTime <= _kTapMaxDuration;
+    _tapPointer = null;
+    if (!isTap || _suspendCurlForLayoutSwitch) return;
+
+    final double x = event.localPosition.dx;
+    final double width = viewportSize.width;
+    if (x < width * _kEdgeZoneLeft) {
+      _prevPanel(viewportSize);
+    } else if (x > width * _kEdgeZoneRight) {
+      _nextPanel(viewportSize);
+    }
+  }
+
+  void _onReaderPointerCancel(PointerCancelEvent event) {
+    _pointerDownAt = null;
+    _downPointers.remove(event.pointer);
+    if (_tapPointer == event.pointer) _tapPointer = null;
+  }
+
+  // A zoom (animated panel focus, pinch or pan) has ended. The curl layer no
+  // longer captures its snapshot at touch-down (see _kCaptureSnapshotOnTouchDown
+  // in comic_page_curl_transition.dart), so it is refreshed here once the
+  // picture has stopped moving: the reader is looking at the panel right now,
+  // the cheapest moment for a full-page raster, and the next swipe then starts
+  // from a texture that matches the screen.
+  void _noteZoomSettled() {
+    if (!_useCurl) return;
+    _zoomSnapshotTimer?.cancel();
+    _zoomSnapshotTimer = Timer(const Duration(milliseconds: 280), () {
+      if (!mounted ||
+          !_useCurl ||
+          _suspendCurlForLayoutSwitch ||
+          !_isPagerSettled) {
+        return;
+      }
+      // Another zoom animation started meanwhile; its completion re-arms this.
+      if (_animationController.isAnimating) return;
+      _curlSnapshotTick.value++;
+    });
   }
 
   void _resetZoomInstant({bool force = false}) {
@@ -1489,12 +1735,10 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     final Matrix4 beginMatrix = _transformationController.value;
     final Matrix4 endMatrix = Matrix4.identity();
 
-    _zoomAnimation = Matrix4Tween(begin: beginMatrix, end: endMatrix).animate(
-      CurvedAnimation(
-        parent: _animationController,
-        curve: Curves.easeInOutCubic,
-      ),
-    );
+    _zoomAnimation = Matrix4Tween(
+      begin: beginMatrix,
+      end: endMatrix,
+    ).animate(_zoomCurve);
 
     _animationController.forward(from: 0.0);
   }
@@ -1549,12 +1793,10 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       ..translateByDouble(targetX, targetY, 0.0, 1.0)
       ..scaleByDouble(targetScale, targetScale, 1.0, 1.0);
 
-    _zoomAnimation = Matrix4Tween(begin: beginMatrix, end: endMatrix).animate(
-      CurvedAnimation(
-        parent: _animationController,
-        curve: Curves.easeInOutCubic,
-      ),
-    );
+    _zoomAnimation = Matrix4Tween(
+      begin: beginMatrix,
+      end: endMatrix,
+    ).animate(_zoomCurve);
 
     _animationController.forward(from: 0.0);
   }
@@ -2151,6 +2393,13 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     final double screenWidth = viewportSize.width;
     final double tapX = details.localPosition.dx;
 
+    // Edge zones are handled on finger-up (see _onReaderPointerUp).
+    if (_kInstantEdgeTaps &&
+        (tapX < screenWidth * _kEdgeZoneLeft ||
+            tapX > screenWidth * _kEdgeZoneRight)) {
+      return;
+    }
+
     if (tapX < screenWidth * 0.3) {
       _prevPanel(viewportSize);
     } else if (tapX > screenWidth * 0.7) {
@@ -2174,6 +2423,14 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // Double-tap: zoom into the tapped panel, or return to the full page view
   void _handleDoubleTap(Offset localPos, Size viewportSize) {
     if (_navBusy || _suspendCurlForLayoutSwitch) return;
+
+    // Taps in the edge zones are navigation taps (see _onReaderPointerUp); a
+    // quick second tap there steps on again instead of zooming.
+    if (_kInstantEdgeTaps &&
+        (localPos.dx < viewportSize.width * _kEdgeZoneLeft ||
+            localPos.dx > viewportSize.width * _kEdgeZoneRight)) {
+      return;
+    }
 
     if (_fullPagePosition == FullPagePosition.none &&
         _transformationController.value != Matrix4.identity()) {
@@ -2365,6 +2622,31 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) {
       unawaited(_progress?.flush());
+      // A pointer-up that never arrives must not leave a stale finger behind.
+      _downPointers.clear();
+      _tapPointer = null;
+    }
+  }
+
+  // The OS is short of memory: release everything that can be rebuilt. The
+  // framework already clears the ImageCache; this also drops the encoded bytes
+  // of every page outside the current spread (they are re-read on demand when
+  // their page is built again).
+  @override
+  void didHaveMemoryPressure() {
+    if (!mounted || !_isEngineReady) return;
+    final List<List<int>> layout = _getEffectiveLayout();
+    if (layout.isEmpty) return;
+    final int virtual = _findVirtualPageIndex(_currentPage);
+    if (virtual < 0 || virtual >= layout.length) return;
+    final Set<int> keep = layout[virtual].toSet();
+    final List<int> drop = _pageBytes.keys
+        .where((int page) => !keep.contains(page))
+        .toList();
+    for (final int page in drop) {
+      final Uint8List? bytes = _pageBytes.remove(page);
+      if (bytes != null) unawaited(_pageImageProvider(page, bytes).evict());
+      _pageProviders.remove(page);
     }
   }
 
@@ -2451,13 +2733,11 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
                       ),
                       child: Listener(
                         behavior: HitTestBehavior.translucent,
-                        onPointerDown: (PointerDownEvent event) =>
-                            _pointerDownAt = event.position,
+                        onPointerDown: _onReaderPointerDown,
                         onPointerMove: _onReaderPointerMove,
                         onPointerUp: (PointerUpEvent event) =>
-                            _pointerDownAt = null,
-                        onPointerCancel: (PointerCancelEvent event) =>
-                            _pointerDownAt = null,
+                            _onReaderPointerUp(event, constraints.biggest),
+                        onPointerCancel: _onReaderPointerCancel,
                         child: _useCurl
                             ? ComicCurlPageView.builder(
                                 controller: _pageController,
@@ -2538,7 +2818,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   ScrollPhysics get _pagerPhysics =>
       (_isScreenLocked || _suspendCurlForLayoutSwitch)
       ? const NeverScrollableScrollPhysics()
-      : const BouncingScrollPhysics();
+      : const _ReaderPagerPhysics(parent: BouncingScrollPhysics());
 
   void _onPagerPageChanged(int virtualIndex) {
     // Programmatic navigation and layout remapping already own the reader
@@ -2562,6 +2842,10 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
         transformationController: controller,
         minScale: 1.0,
         maxScale: 5.0,
+        // Pinch / pan finished: refresh the curl snapshot once it settles.
+        onInteractionEnd: controller == null
+            ? null
+            : (ScaleEndDetails details) => _noteZoomSettled(),
         child: Center(child: _buildVirtualPageContent(virtualIndex)),
       ),
     );
@@ -2961,13 +3245,20 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     }
 
     return imgSize == null
-        ? Image.memory(bytes, fit: BoxFit.contain)
+        ? Image(
+            image: _pageImageProvider(pageIndex, bytes),
+            fit: BoxFit.contain,
+          )
         : AspectRatio(
             aspectRatio: imgSize.width / imgSize.height,
             child: Stack(
               fit: StackFit.passthrough,
               children: [
-                Image.memory(bytes, fit: BoxFit.contain, gaplessPlayback: true),
+                Image(
+                  image: _pageImageProvider(pageIndex, bytes),
+                  fit: BoxFit.contain,
+                  gaplessPlayback: true,
+                ),
                 if (!forCurlBackFace && _showPanelOutlines)
                   CustomPaint(
                     painter: ComicPanelPainter(
@@ -3065,7 +3356,11 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       fit: StackFit.expand,
       children: [
         if (bytes != null)
-          Image.memory(bytes, fit: BoxFit.fill, gaplessPlayback: true)
+          Image(
+            image: _pageImageProvider(page, bytes),
+            fit: BoxFit.fill,
+            gaplessPlayback: true,
+          )
         else
           const Center(
             child: SizedBox(

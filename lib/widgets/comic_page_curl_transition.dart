@@ -138,21 +138,60 @@ const double _kTextureHandoffWindow = 0.018;
 const double _kEffectFadeWindow = 0.03;
 const double _kEffectEpsilon = 0.002;
 
-// Snapshot (page texture) budget. Numbers are PIXELS, not bytes: 16 Mpx is
-// 64 MB of RGBA, 24 Mpx is 96 MB.
+// Snapshot (page texture) budget. Numbers are PIXELS, not bytes: 10 Mpx is
+// 40 MB of RGBA, 16 Mpx is 64 MB. A full-screen page on a 1080 x 2400 phone is
+// only ~2.6 Mpx (10 MB), and even a 12.9" tablet page is ~5.6 Mpx, so these
+// ceilings never bind on real devices; they are insurance against unusual
+// window sizes / extreme densities, where the previous 16 / 24 Mpx limits
+// allowed 64-96 MB for ONE texture.
 const double _kSnapshotMaxDpr = 4.0;
-const double _kSnapshotMaxPixels = 16.0 * 1024.0 * 1024.0;
+const double _kSnapshotMaxPixels = 10.0 * 1024.0 * 1024.0;
 const double _kSnapshotMaxDimension = 6144.0;
 // Two-page spreads carry twice the artwork, so they get a larger budget that
 // scales with how much of the viewport width the leaves actually cover.
 const double _kSpreadSnapshotMaxDpr = 4.5;
-const double _kSpreadSnapshotMaxPixels = 24.0 * 1024.0 * 1024.0;
+const double _kSpreadSnapshotMaxPixels = 16.0 * 1024.0 * 1024.0;
 const double _kSpreadSnapshotMaxDimension = 8192.0;
 // Hard ceiling for all retained snapshots together (current page + stale
 // neighbours), so the larger spread budget cannot stack up on low-memory
-// devices. The anchor page's snapshot is never evicted.
-const double _kSnapshotTotalPixelCap = 56.0 * 1024.0 * 1024.0;
+// devices. The anchor page's snapshot is never evicted. (Three phone-sized
+// snapshots are ~8 Mpx, so this only trims genuinely oversized cases; the
+// OS memory-pressure callback trims much earlier, see didHaveMemoryPressure.)
+const double _kSnapshotTotalPixelCap = 32.0 * 1024.0 * 1024.0;
 const int _kSnapshotPaintRetries = 3;
+
+// --- Frame-budget / touch-latency tuning --------------------------------------
+//
+// Taking a snapshot re-rasterises the whole page on the raster thread: a few
+// milliseconds on a mid-range GPU, noticeably more on a low-end 60 Hz one. WHEN
+// that happens decides whether a tap or a swipe drops a frame.
+
+/// true  = capture the settled page on every pointer-down (original behaviour:
+///         every tap, pan and swipe paid for a full-page raster at touch-down).
+/// false = capture on the first horizontal movement instead, so taps never
+///         capture; the host refreshes the snapshot when a zoom settles
+///         (see the reader's zoom-settle refresh), so it is normally current.
+const bool _kCaptureSnapshotOnTouchDown = false;
+
+/// Horizontal travel (logical px) after which a gesture counts as a swipe for
+/// the capture above: just past the platform touch slop (~8 px) and past the
+/// reader's 9 px "land the running zoom" threshold, so the zoom is already
+/// final when the snapshot is taken.
+const double _kSnapshotMoveSlop = 10.0;
+
+/// Rebuilds of the host (page bytes landed, panels detected, a panel tap) make
+/// PageView call the item builder again, which used to re-capture every visible
+/// page each time: several full-page rasters per page turn. Those requests are
+/// now coalesced into ONE capture this long after the last rebuild ...
+const Duration _kBuildRefreshDebounce = Duration(milliseconds: 320);
+
+/// ... but never later than this after the first one.
+const Duration _kBuildRefreshMaxWait = Duration(milliseconds: 900);
+
+/// Default wait of [ComicCurlSnapshotController.refresh] (was 160 ms). A
+/// full-page capture right after a layout change can exceed 160 ms on a slow
+/// GPU; timing out there starts the turn with a stale texture.
+const Duration _kSnapshotRefreshTimeout = Duration(milliseconds: 260);
 
 double _clamp(double v, double lo, double hi) =>
     v < lo ? lo : (v > hi ? hi : v);
@@ -195,7 +234,7 @@ class ComicCurlSnapshotController {
   /// layer cannot take one (disabled, not attached, not built yet), or after
   /// [timeout]. Never throws and never waits indefinitely.
   Future<void> refresh({
-    Duration timeout = const Duration(milliseconds: 160),
+    Duration timeout = _kSnapshotRefreshTimeout,
   }) {
     final _ComicCurlPageViewState? state = _state;
     if (state == null) return Future<void>.value();
@@ -288,7 +327,8 @@ class ComicCurlPageView extends StatefulWidget {
   State<ComicCurlPageView> createState() => _ComicCurlPageViewState();
 }
 
-class _ComicCurlPageViewState extends State<ComicCurlPageView> {
+class _ComicCurlPageViewState extends State<ComicCurlPageView>
+    with WidgetsBindingObserver {
   // Pointer position in normalized viewport coordinates. X is captured when
   // the gesture starts and held stable; Y follows the finger (low-pass
   // filtered) while a turn is in progress, so diagonal drags bend the fold
@@ -329,9 +369,28 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
   double _grabY = _kDefaultTouchY;
   bool _turnStartNotified = false;
 
+  // --- Capture policy (see the _k... tuning constants) ----------------------
+  // Horizontal start of the current gesture, and whether the gesture has
+  // already asked for its snapshot.
+  double _gestureDownX = 0.0;
+  bool _gestureCaptureRequested = false;
+  // Rebuild-triggered refreshes waiting for their debounce.
+  final Set<int> _buildRefreshPending = <int>{};
+  Timer? _buildRefreshTimer;
+  DateTime? _buildRefreshFirstRequest;
+
+  // Back-face widgets built since the host last rebuilt this view. Handing the
+  // framework the SAME instance on every frame of a turn lets it skip
+  // rebuilding that subtree 60 times a second.
+  final Map<int, Widget> _backFaceWidgets = <int, Widget>{};
+
+  // Geometry shared by the two page layers of a frame.
+  final _CurlGeometryCache _geometryCache = _CurlGeometryCache();
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _anchor = widget.controller.initialPage.toDouble();
     _repaint = Listenable.merge(<Listenable>[
       widget.controller,
@@ -390,6 +449,10 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _buildRefreshTimer?.cancel();
+    _buildRefreshPending.clear();
+    _backFaceWidgets.clear();
     widget.controller.removeListener(_settleAnchor);
     widget.snapshotInvalidator?.removeListener(_onSnapshotInvalidated);
     if (widget.snapshotController?._state == this) {
@@ -404,6 +467,23 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
     _snapshotRevision.dispose();
     _touchPosition.dispose();
     super.dispose();
+  }
+
+  @override
+  void didHaveMemoryPressure() {
+    // The OS is short of memory: keep only the snapshot a turn that starts
+    // right now would use. Neighbours are captured again when they are needed.
+    if (!mounted || _snapshots.isEmpty) return;
+    final int center = _anchor.round();
+    final List<int> drop = _snapshots.keys
+        .where((int index) => index != center)
+        .toList();
+    for (final int index in drop) {
+      final ui.Image? image = _snapshots.remove(index);
+      _snapshotSizes.remove(index);
+      if (image != null) _disposeImageAfterFrame(image);
+    }
+    if (drop.isNotEmpty) _snapshotRevision.value++;
   }
 
   GlobalKey _snapshotKeyFor(int index) => _snapshotKeys.putIfAbsent(
@@ -515,6 +595,70 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
       _snapshotScheduled.remove(index);
       if (mounted) _captureSnapshot(index);
     });
+    // A post-frame callback does not request a frame by itself. Callers that
+    // run from a timer, a listener or a pointer handler (not from inside a
+    // build) must make sure one happens, or the capture would wait for the next
+    // unrelated frame. Inside a build this is a no-op.
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  /// True when [index] has a snapshot captured at the current viewport size.
+  bool _hasFreshSnapshot(int index) {
+    final Size? viewport = _viewportSize;
+    final Size? captured = _snapshotSizes[index];
+    if (viewport == null ||
+        captured == null ||
+        !_snapshots.containsKey(index)) {
+      return false;
+    }
+    return (captured.width - viewport.width).abs() <= 0.5 &&
+        (captured.height - viewport.height).abs() <= 0.5;
+  }
+
+  /// Snapshot request that comes from the host rebuilding this view (PageView
+  /// runs the item builder again for every visible page).
+  ///
+  /// A page without a current-size snapshot is captured right away: that is
+  /// how neighbours enter the cache before a drag reaches them. A page that
+  /// already has one has at most changed in small ways (image bytes landed,
+  /// panels detected, a panel tap), and those events arrive in bursts, so the
+  /// refresh is debounced into ONE capture instead of one per rebuild.
+  void _requestSnapshotFromBuild(int index) {
+    if (!widget.enabled || index < 0 || index >= widget.itemCount) return;
+    if (!_hasFreshSnapshot(index)) {
+      _scheduleSnapshot(index);
+      return;
+    }
+    _buildRefreshPending.add(index);
+    final DateTime now = DateTime.now();
+    final DateTime first = _buildRefreshFirstRequest ??= now;
+    final bool overdue = now.difference(first) >= _kBuildRefreshMaxWait;
+    _buildRefreshTimer?.cancel();
+    _buildRefreshTimer = Timer(
+      overdue ? Duration.zero : _kBuildRefreshDebounce,
+      _flushBuildRefresh,
+    );
+  }
+
+  void _flushBuildRefresh() {
+    _buildRefreshTimer = null;
+    if (!mounted || !widget.enabled) {
+      _buildRefreshPending.clear();
+      _buildRefreshFirstRequest = null;
+      return;
+    }
+    // A finger on the page or a turn in flight owns the snapshots (the settle
+    // capture refreshes the anchor once the turn ends): try again later.
+    if (_activePointer != null || _isTurning()) {
+      _buildRefreshTimer = Timer(_kBuildRefreshDebounce, _flushBuildRefresh);
+      return;
+    }
+    final List<int> pending = _buildRefreshPending.toList();
+    _buildRefreshPending.clear();
+    _buildRefreshFirstRequest = null;
+    for (final int index in pending) {
+      _scheduleSnapshot(index);
+    }
   }
 
   // Capture close to the device's native pixel density, but cap total pixels
@@ -744,7 +888,15 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
       _touchTarget = target;
       _touchNeedsSnap = false;
       _touchPosition.value = target;
-      _scheduleSnapshot(_anchor.round());
+      // Capture policy: see [_kCaptureSnapshotOnTouchDown]. A page that has no
+      // current snapshot at all is still captured immediately.
+      _gestureDownX = event.localPosition.dx;
+      _gestureCaptureRequested = false;
+      final int anchorIndex = _anchor.round();
+      if (_kCaptureSnapshotOnTouchDown || !_hasFreshSnapshot(anchorIndex)) {
+        _gestureCaptureRequested = true;
+        _scheduleSnapshot(anchorIndex);
+      }
       return;
     }
 
@@ -757,6 +909,15 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
       // the curl layer.
       final Offset target = normalized();
       _touchTarget = target;
+      // First real horizontal movement of this gesture: now the page is going
+      // to be peeled, so take the snapshot (a plain tap never gets here).
+      if (!_gestureCaptureRequested &&
+          (event.localPosition.dx - _gestureDownX).abs() >=
+              _kSnapshotMoveSlop &&
+          !_isTurning()) {
+        _gestureCaptureRequested = true;
+        _scheduleSnapshot(_anchor.round());
+      }
       if (!_isTurning()) {
         _touchNeedsSnap = true;
         return;
@@ -804,7 +965,12 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
       widget.itemBuilder(context, index);
 
   Widget _buildBackFaceItem(BuildContext context, int index) =>
-      widget.backFaceBuilder?.call(context, index) ?? _buildItem(context, index);
+      _backFaceWidgets.putIfAbsent(
+        index,
+        () =>
+            widget.backFaceBuilder?.call(context, index) ??
+            _buildItem(context, index),
+      );
 
   bool _isPagerActivelyScrolling() {
     if (!widget.controller.hasClients ||
@@ -851,6 +1017,8 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
 
   @override
   Widget build(BuildContext context) {
+    // The host rebuilt: whatever it would build for the back face may differ.
+    _backFaceWidgets.clear();
     return _CurlScope(
       controller: widget.controller,
       repaint: _repaint,
@@ -869,6 +1037,7 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
       buildItem: _buildItem,
       buildBackFaceItem: _buildBackFaceItem,
       snapshot: _snapshotFor,
+      geometryCache: _geometryCache,
       child: LayoutBuilder(
         builder: (BuildContext context, BoxConstraints constraints) {
           final Size touchSize = constraints.biggest;
@@ -894,8 +1063,10 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView> {
                 // turn already has the previous page's texture before the
                 // curl becomes visible (rather than briefly showing the
                 // outgoing page while that texture is being captured).
+                // Pages that already have a texture are only refreshed after
+                // the host's rebuild burst has died down (debounced).
                 final GlobalKey snapshotKey = _snapshotKeyFor(index);
-                _scheduleSnapshot(index);
+                _requestSnapshotFromBuild(index);
                 return ComicPageCurlTransition(
                   index: index,
                   child: RepaintBoundary(
@@ -1085,23 +1256,30 @@ class ComicPageCurlTransition extends StatelessWidget {
     }
 
     final double clampedProgress = _clamp(progress, 0.0, 1.0);
-    final _CurlGeometry geometry = _CurlGeometry.compute(
-      size: size,
-      paper: paper,
-      progress: clampedProgress,
-      touchPosition: scope.touchPosition.value,
-      grabY: scope.grabY(),
-      forwardTurn: forward,
-      radiusFraction: scope.radiusFraction,
-      book: book,
-      mirrored: book && !forward,
-      underWindow: underWindow,
-      hingeWindow: hingeWindow,
-      // Whole-sheet folds straighten as the curl completes (books taper
-      // their tilt on their own).
-      tiltScale: book
-          ? 1.0
-          : 1.0 - _smoothStep(_kStraightFoldStart, 1.0, completion),
+    // The top page and the page underneath both need the SAME geometry in a
+    // frame. It costs several Path.combine boolean operations, so it is
+    // computed once per frame and shared (see _CurlGeometryCache). It also keeps
+    // the Path objects identical between frames whose inputs did not change,
+    // which lets the clippers and painters skip needless work.
+    final _CurlGeometry geometry = scope.geometryCache.obtain(
+      _CurlGeometryKey(
+        size: size,
+        paper: paper,
+        progress: clampedProgress,
+        touchPosition: scope.touchPosition.value,
+        grabY: scope.grabY(),
+        forwardTurn: forward,
+        radiusFraction: scope.radiusFraction,
+        book: book,
+        mirrored: book && !forward,
+        underWindow: underWindow,
+        hingeWindow: hingeWindow,
+        // Whole-sheet folds straighten as the curl completes (books taper
+        // their tilt on their own).
+        tiltScale: book
+            ? 1.0
+            : 1.0 - _smoothStep(_kStraightFoldStart, 1.0, completion),
+      ),
     );
 
     // Blend the raster mesh into the live page at the start/end of a turn.
@@ -1314,6 +1492,7 @@ class _CurlScope extends InheritedWidget {
     required this.buildItem,
     required this.buildBackFaceItem,
     required this.snapshot,
+    required this.geometryCache,
     required super.child,
   });
 
@@ -1334,6 +1513,9 @@ class _CurlScope extends InheritedWidget {
   final Widget Function(BuildContext context, int index) buildItem;
   final Widget Function(BuildContext context, int index) buildBackFaceItem;
   final ui.Image? Function(int index, Size size) snapshot;
+
+  /// Not part of [updateShouldNotify]: one instance lives as long as the state.
+  final _CurlGeometryCache geometryCache;
 
   @override
   bool updateShouldNotify(_CurlScope old) {
@@ -1386,6 +1568,107 @@ class _BusyDragBlocker extends HorizontalDragGestureRecognizer {
   @override
   bool isPointerAllowed(PointerEvent event) {
     return isBlocked() && super.isPointerAllowed(event as PointerDownEvent);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame geometry sharing
+// ---------------------------------------------------------------------------
+
+/// Every input of [_CurlGeometry.compute]. Two frames with equal keys have
+/// identical geometry.
+class _CurlGeometryKey {
+  const _CurlGeometryKey({
+    required this.size,
+    required this.paper,
+    required this.progress,
+    required this.touchPosition,
+    required this.grabY,
+    required this.forwardTurn,
+    required this.radiusFraction,
+    required this.book,
+    required this.mirrored,
+    required this.underWindow,
+    required this.hingeWindow,
+    required this.tiltScale,
+  });
+
+  final Size size;
+  final Rect paper;
+  final double progress;
+  final Offset touchPosition;
+  final double grabY;
+  final bool forwardTurn;
+  final double radiusFraction;
+  final bool book;
+  final bool mirrored;
+  final Rect? underWindow;
+  final Rect? hingeWindow;
+  final double tiltScale;
+
+  @override
+  bool operator ==(Object other) =>
+      other is _CurlGeometryKey &&
+      other.size == size &&
+      other.paper == paper &&
+      other.progress == progress &&
+      other.touchPosition == touchPosition &&
+      other.grabY == grabY &&
+      other.forwardTurn == forwardTurn &&
+      other.radiusFraction == radiusFraction &&
+      other.book == book &&
+      other.mirrored == mirrored &&
+      other.underWindow == underWindow &&
+      other.hingeWindow == hingeWindow &&
+      other.tiltScale == tiltScale;
+
+  @override
+  int get hashCode => Object.hash(
+    size,
+    paper,
+    progress,
+    touchPosition,
+    grabY,
+    forwardTurn,
+    radiusFraction,
+    book,
+    mirrored,
+    underWindow,
+    hingeWindow,
+    tiltScale,
+  );
+}
+
+/// One-entry memo for [_CurlGeometry.compute].
+///
+/// Both pages of a curl frame (the sheet being peeled and the one revealed
+/// under it) are built in the same frame from the same pointer / scroll state,
+/// so the second page always hits the entry the first one just stored: the
+/// boolean path operations run once per frame instead of twice.
+class _CurlGeometryCache {
+  _CurlGeometryKey? _key;
+  _CurlGeometry? _geometry;
+
+  _CurlGeometry obtain(_CurlGeometryKey key) {
+    final _CurlGeometry? cached = _geometry;
+    if (cached != null && key == _key) return cached;
+    final _CurlGeometry fresh = _CurlGeometry.compute(
+      size: key.size,
+      paper: key.paper,
+      progress: key.progress,
+      touchPosition: key.touchPosition,
+      grabY: key.grabY,
+      forwardTurn: key.forwardTurn,
+      radiusFraction: key.radiusFraction,
+      book: key.book,
+      mirrored: key.mirrored,
+      underWindow: key.underWindow,
+      hingeWindow: key.hingeWindow,
+      tiltScale: key.tiltScale,
+    );
+    _key = key;
+    _geometry = fresh;
+    return fresh;
   }
 }
 
@@ -1974,13 +2257,6 @@ List<Offset> _clipBySide(
 // Textured front-sheet mesh
 // ---------------------------------------------------------------------------
 
-class _CurlMeshPoint {
-  const _CurlMeshPoint(this.source, this.s);
-
-  final Offset source;
-  final double s;
-}
-
 /// Maps logical source coordinates onto texels of a page snapshot.
 ///
 /// [_TextureWindow.global] uses one scale for the whole image (single page).
@@ -2082,28 +2358,21 @@ class _CurlTexturePainter extends CustomPainter {
   static const int _columns = 42;
   static const int _rows = 42;
 
-  List<_CurlMeshPoint> _clipTriangle(List<_CurlMeshPoint> triangle) {
-    final List<_CurlMeshPoint> output = <_CurlMeshPoint>[];
-    for (int i = 0; i < triangle.length; i++) {
-      final _CurlMeshPoint current = triangle[i];
-      final _CurlMeshPoint next = triangle[(i + 1) % triangle.length];
-      final bool currentInside = current.s <= geometry.frontTextureLimit;
-      final bool nextInside = next.s <= geometry.frontTextureLimit;
-
-      if (currentInside) output.add(current);
-      if (currentInside != nextInside) {
-        final double denominator = next.s - current.s;
-        if (denominator.abs() > 1e-9) {
-          final double t =
-              (geometry.frontTextureLimit - current.s) / denominator;
-          final Offset source = Offset.lerp(current.source, next.source, t)!;
-          output.add(_CurlMeshPoint(source, geometry.frontTextureLimit));
-        }
-      }
-    }
-    return output;
-  }
-
+  /// Builds the cylindrical mesh and draws the snapshot through it.
+  ///
+  /// This runs on the UI isolate every frame of a curl, so it is written to be
+  /// cheap on a low-end CPU:
+  ///  * the grid is evaluated once per VERTEX (1849 of them), not once per
+  ///    triangle corner (~10 500): `sourceS`, `projectFrontPoint` (a `sin`) and
+  ///    the UV math are shared by the up-to-six triangles that meet at a vertex;
+  ///  * the mesh is indexed (`Vertices.raw(indices: ...)`), so shared vertices
+  ///    are uploaded once;
+  ///  * vertices beyond the visible limit (the part of the sheet that has
+  ///    already rolled onto the back) are never projected at all;
+  ///  * only the handful of triangles that straddle the limit are clipped (the
+  ///    same Sutherland-Hodgman cut as before, so the picture is identical),
+  ///    and typed arrays replace the growing `List<double>`s and the ~7 000
+  ///    short-lived per-triangle lists the old builder allocated.
   @override
   void paint(Canvas canvas, Size size) {
     final Rect sourceRect = geometry.sheet.intersect(Offset.zero & size);
@@ -2114,9 +2383,6 @@ class _CurlTexturePainter extends CustomPainter {
       return;
     }
 
-    final List<double> positions = <double>[];
-    final List<double> textureCoordinates = <double>[];
-
     // The captured bitmap may be smaller than DPR x logical size (memory
     // cap), so device DPR alone is not the UV step. Each axis, and in a spread
     // each leaf, derives its own scale from the bitmap's real texel grid.
@@ -2124,80 +2390,148 @@ class _CurlTexturePainter extends CustomPainter {
         ? _TextureWindow.leaf(image, logicalSize, sourceRect)
         : _TextureWindow.global(image, logicalSize);
 
-    void addVertex(_CurlMeshPoint point) {
-      final Offset target = geometry.projectFrontPoint(point.source);
-      positions
-        ..add(target.dx)
-        ..add(target.dy);
-      textureCoordinates
-        ..add(window.u(point.source.dx))
-        ..add(window.v(point.source.dy));
-    }
+    const int columns = _columns;
+    const int rows = _rows;
+    const int stride = columns + 1;
+    const int gridCount = stride * (rows + 1);
+    final double limit = geometry.frontTextureLimit;
 
-    void addTriangle(
-      _CurlMeshPoint a,
-      _CurlMeshPoint b,
-      _CurlMeshPoint c,
-    ) {
-      final List<_CurlMeshPoint> clipped = _clipTriangle(<_CurlMeshPoint>[
-        a,
-        b,
-        c,
-      ]);
-      if (clipped.length < 3) return;
-      for (int i = 1; i < clipped.length - 1; i++) {
-        addVertex(clipped[0]);
-        addVertex(clipped[i]);
-        addVertex(clipped[i + 1]);
-      }
-    }
-
-    final double cellWidth = sourceRect.width / _columns;
-    final double cellHeight = sourceRect.height / _rows;
-    final List<_CurlMeshPoint> grid = <_CurlMeshPoint>[];
-    // Snap interior samples to whole texels of the window (per leaf in a
+    // Source coordinates of the grid lines. Keep exact outer boundaries but
+    // snap interior lines to the captured texture's texel grid (per leaf in a
     // spread) so the mesh samples the bitmap 1:1 where it is flat.
-    double snapX(double value) => window.snapX(value);
-    double snapY(double value) => window.snapY(value);
-
-    for (int row = 0; row <= _rows; row++) {
-      // Keep exact outer boundaries but align interior samples to the
-      // captured texture's texel grid. This removes fractional UV drift from
-      // each half of a virtual wide page while retaining the shared spine.
+    final double cellWidth = sourceRect.width / columns;
+    final double cellHeight = sourceRect.height / rows;
+    final Float64List xs = Float64List(stride);
+    final Float64List ys = Float64List(rows + 1);
+    for (int column = 0; column <= columns; column++) {
+      final double rawX = sourceRect.left + cellWidth * column;
+      xs[column] = column == 0 || column == columns
+          ? rawX
+          : window.snapX(rawX);
+    }
+    for (int row = 0; row <= rows; row++) {
       final double rawY = sourceRect.top + cellHeight * row;
-      final double y = row == 0 || row == _rows
-          ? rawY
-          : snapY(rawY);
-      for (int column = 0; column <= _columns; column++) {
-        final double rawX = sourceRect.left + cellWidth * column;
-        final double x = column == 0 || column == _columns
-            ? rawX
-            : snapX(rawX);
-        final Offset source = Offset(x, y);
-        grid.add(_CurlMeshPoint(source, geometry.sourceS(source)));
+      ys[row] = row == 0 || row == rows ? rawY : window.snapY(rawY);
+    }
+
+    // One pass over the grid: projected position and UV, only for vertices on
+    // the visible side of the limit.
+    final Float64List sValues = Float64List(gridCount);
+    final Uint8List inside = Uint8List(gridCount);
+    final Float32List gridPositions = Float32List(gridCount * 2);
+    final Float32List gridUvs = Float32List(gridCount * 2);
+    for (int row = 0; row <= rows; row++) {
+      final double y = ys[row];
+      for (int column = 0; column <= columns; column++) {
+        final int i = row * stride + column;
+        final Offset source = Offset(xs[column], y);
+        final double s = geometry.sourceS(source);
+        sValues[i] = s;
+        if (s > limit) continue;
+        inside[i] = 1;
+        final Offset target = geometry.projectFrontPoint(source);
+        gridPositions[2 * i] = target.dx;
+        gridPositions[2 * i + 1] = target.dy;
+        gridUvs[2 * i] = window.u(source.dx);
+        gridUvs[2 * i + 1] = window.v(source.dy);
       }
     }
 
-    _CurlMeshPoint at(int row, int column) =>
-        grid[row * (_columns + 1) + column];
+    // Triangles as indices into the shared vertex arrays. Worst case every
+    // triangle is clipped into a quad (two triangles = six indices).
+    final Uint16List indices = Uint16List(rows * columns * 12);
+    int indexCount = 0;
+    // Intersection points created by clipping; appended after the grid.
+    final List<double> extraPositions = <double>[];
+    final List<double> extraUvs = <double>[];
 
-    for (int row = 0; row < _rows; row++) {
-      for (int column = 0; column < _columns; column++) {
-        final _CurlMeshPoint topLeft = at(row, column);
-        final _CurlMeshPoint topRight = at(row, column + 1);
-        final _CurlMeshPoint bottomRight = at(row + 1, column + 1);
-        final _CurlMeshPoint bottomLeft = at(row + 1, column);
+    void addTriangle(int a, int b, int c) {
+      final int insideCount = inside[a] + inside[b] + inside[c];
+      if (insideCount == 0) return;
+      if (insideCount == 3) {
+        indices[indexCount++] = a;
+        indices[indexCount++] = b;
+        indices[indexCount++] = c;
+        return;
+      }
+
+      // The limit crosses this triangle: cut it exactly like the old
+      // per-triangle clip did (keep the side where s <= limit).
+      final List<int> triangle = <int>[a, b, c];
+      final List<int> polygon = <int>[];
+      for (int k = 0; k < 3; k++) {
+        final int current = triangle[k];
+        final int next = triangle[(k + 1) % 3];
+        final bool currentInside = inside[current] == 1;
+        final bool nextInside = inside[next] == 1;
+
+        if (currentInside) polygon.add(current);
+        if (currentInside != nextInside) {
+          final double denominator = sValues[next] - sValues[current];
+          if (denominator.abs() > 1e-9) {
+            final double t = (limit - sValues[current]) / denominator;
+            final double currentX = xs[current % stride];
+            final double currentY = ys[current ~/ stride];
+            final Offset source = Offset(
+              currentX + (xs[next % stride] - currentX) * t,
+              currentY + (ys[next ~/ stride] - currentY) * t,
+            );
+            final Offset target = geometry.projectFrontPoint(source);
+            polygon.add(gridCount + extraPositions.length ~/ 2);
+            extraPositions
+              ..add(target.dx)
+              ..add(target.dy);
+            extraUvs
+              ..add(window.u(source.dx))
+              ..add(window.v(source.dy));
+          }
+        }
+      }
+      for (int k = 1; k < polygon.length - 1; k++) {
+        indices[indexCount++] = polygon[0];
+        indices[indexCount++] = polygon[k];
+        indices[indexCount++] = polygon[k + 1];
+      }
+    }
+
+    for (int row = 0; row < rows; row++) {
+      for (int column = 0; column < columns; column++) {
+        final int topLeft = row * stride + column;
+        final int topRight = topLeft + 1;
+        final int bottomLeft = topLeft + stride;
+        final int bottomRight = bottomLeft + 1;
+        // A cell with no corner on the visible side contributes nothing.
+        if (inside[topLeft] + inside[topRight] + inside[bottomLeft] +
+                inside[bottomRight] ==
+            0) {
+          continue;
+        }
         addTriangle(topLeft, topRight, bottomRight);
         addTriangle(topLeft, bottomRight, bottomLeft);
       }
     }
 
-    if (positions.isEmpty) return;
+    if (indexCount == 0) return;
+
+    final int extraCount = extraPositions.length ~/ 2;
+    final int vertexCount = gridCount + extraCount;
+    // Indices are 16-bit. (1849 grid vertices + a few hundred cut points.)
+    if (vertexCount > 0xFFFF) return;
+
+    final Float32List positions = Float32List(vertexCount * 2)
+      ..setRange(0, gridCount * 2, gridPositions);
+    final Float32List textureCoordinates = Float32List(vertexCount * 2)
+      ..setRange(0, gridCount * 2, gridUvs);
+    for (int k = 0; k < extraPositions.length; k++) {
+      positions[gridCount * 2 + k] = extraPositions[k];
+      textureCoordinates[gridCount * 2 + k] = extraUvs[k];
+    }
 
     final ui.Vertices vertices = ui.Vertices.raw(
       ui.VertexMode.triangles,
-      Float32List.fromList(positions),
-      textureCoordinates: Float32List.fromList(textureCoordinates),
+      positions,
+      textureCoordinates: textureCoordinates,
+      indices: Uint16List.sublistView(indices, 0, indexCount),
     );
     final ui.ImageShader shader = ui.ImageShader(
       image,
@@ -2207,12 +2541,20 @@ class _CurlTexturePainter extends CustomPainter {
     );
     final Paint paint = Paint()
       ..isAntiAlias = true
-      ..colorFilter = ColorFilter.mode(
-        Color.fromRGBO(255, 255, 255, _clamp(opacity, 0.0, 1.0)),
-        BlendMode.modulate,
-      )
-      ..filterQuality = FilterQuality.high
+      // Bilinear. The mesh samples the snapshot 1:1 on the flat part of the
+      // sheet (UVs are snapped to whole texels), where bilinear returns the
+      // texel exactly - bicubic (FilterQuality.high) would blur it slightly -
+      // and it needs 4 texture taps per pixel instead of 16 on a Skia GPU.
+      ..filterQuality = FilterQuality.low
       ..shader = shader;
+    final double alpha = _clamp(opacity, 0.0, 1.0);
+    if (alpha < 0.999) {
+      // Skipped at full opacity: one fewer per-pixel operation on the GPU.
+      paint.colorFilter = ColorFilter.mode(
+        Color.fromRGBO(255, 255, 255, alpha),
+        BlendMode.modulate,
+      );
+    }
 
     canvas.save();
     try {
@@ -2365,5 +2707,13 @@ class _CurlPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _CurlPainter oldDelegate) => true;
+  bool shouldRepaint(covariant _CurlPainter oldDelegate) =>
+      // The geometry object is shared and immutable (see _CurlGeometryCache):
+      // when it is the same instance and the effect strengths are unchanged,
+      // the previous frame's pixels are still correct.
+      !identical(oldDelegate.geometry, geometry) ||
+      oldDelegate.layer != layer ||
+      oldDelegate.role != role ||
+      oldDelegate.shadowOpacity != shadowOpacity ||
+      oldDelegate.highlightOpacity != highlightOpacity;
 }

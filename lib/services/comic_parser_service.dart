@@ -442,7 +442,7 @@ class _ZipWorker {
         _raf = raf;
         _entries = _sortNaturally<_ZipEntry>(
           entries,
-          (_ZipEntry entry) => entry.name,
+          (_ZipEntry entry) => _normalizeArchiveEntryPath(entry.name),
         );
         retainedHandle = true;
         return _entries.length;
@@ -459,15 +459,22 @@ class _ZipWorker {
 
     // ZIP64, encrypted, unsupported-compression and unusual layouts use the
     // complete decoder. This work remains inside the worker isolate.
+    // `Archive.files` is a flat list of every ZIP entry, not just root files;
+    // nested names such as "Chapter 01/page_2.webp" are therefore included.
+    // Apply the same path-aware filter used by the central-directory reader so
+    // both parsing paths discover exactly the same kinds of page images.
     final Archive archive = ZipDecoder().decodeBytes(
       File(path).readAsBytesSync(),
     );
-    final List<ArchiveFile> files = archive.files
-        .where((ArchiveFile file) => file.isFile && _isPageImage(file.name))
-        .toList();
+    final List<ArchiveFile> files = <ArchiveFile>[];
+    for (final ArchiveFile file in archive.files) {
+      if (!file.isFile) continue; // Skip explicit directory entries.
+      if (!_isPageImage(file.name)) continue;
+      files.add(file);
+    }
     _fallback = _sortNaturally<ArchiveFile>(
       files,
-      (ArchiveFile file) => file.name,
+      (ArchiveFile file) => _normalizeArchiveEntryPath(file.name),
     );
     _useFallback = true;
     return _fallback.length;
@@ -604,6 +611,11 @@ List<_ZipEntry>? _readCentralDirectory(RandomAccessFile raf) {
     offset = recordEnd;
     entriesRead++;
 
+    // The ZIP central directory is a flat index: every nested file appears as
+    // its own record with its full relative path (for example, "Vol 1/2.JPG").
+    // Scan every record and filter that complete path rather than assuming
+    // page images must be at the archive root. Directory/metadata entries are
+    // rejected by _isPageImage.
     if (!_isPageImage(name)) continue;
 
     final bool encrypted = (flags & 0x1) != 0;
@@ -749,15 +761,70 @@ List<PageDimensions?> _decodeDims(Int32List flat) => <PageDimensions?>[
         : null,
 ];
 
+/// Normalizes ZIP entry separators without changing the actual archive name.
+/// ZIP paths conventionally use '/', but some tools write Windows '\\'.
+String _normalizeArchiveEntryPath(String path) =>
+    path.replaceAll('\\', '/').replaceAll(RegExp(r'/+'), '/');
+
+const Set<String> _supportedPageExtensions = <String>{
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.webp',
+};
+
+const Set<String> _ignoredArchiveDirectories = <String>{
+  '__macosx',
+  '.spotlight-v100',
+  '.trashes',
+  r'$recycle.bin',
+  'system volume information',
+};
+
+const Set<String> _ignoredArchiveMetadataFiles = <String>{
+  'thumbs.db',
+  'ehthumbs.db',
+  'desktop.ini',
+  '.ds_store',
+};
+
+/// Returns true only for a supported page image anywhere in the ZIP tree.
+///
+/// This is deliberately path-based: ZIP central-directory entries and
+/// package:archive's `Archive.files` are flat lists whose names contain the
+/// nested folder path. Walking a synthetic directory tree is unnecessary and
+/// can accidentally miss entries when a ZIP omits explicit folder records.
 bool _isPageImage(String path) {
-  final String name = path.toLowerCase().replaceAll('\\', '/');
-  return (name.endsWith('.jpg') ||
-          name.endsWith('.jpeg') ||
-          name.endsWith('.png')) &&
-      !name.startsWith('__macosx') &&
-      !name.contains('/__macosx') &&
-      !name.startsWith('.') &&
-      !name.contains('/.');
+  final String normalized = _normalizeArchiveEntryPath(path);
+  if (normalized.isEmpty || normalized.endsWith('/')) return false;
+
+  // Ignore harmless './' prefixes, but reject parent traversal segments.
+  // Empty path components can occur when archives contain repeated slashes.
+  final List<String> segments = normalized
+      .split('/')
+      .where((String segment) => segment.isNotEmpty && segment != '.')
+      .toList(growable: false);
+  if (segments.isEmpty || segments.any((String part) => part == '..')) {
+    return false;
+  }
+
+  // Metadata directories may occur at the root or at any nested level. Match
+  // complete path components (case-insensitively), not loose substrings, so a
+  // real folder such as "__MACOSX_Extras" is not incorrectly discarded.
+  for (final String segment in segments) {
+    final String lowerSegment = segment.toLowerCase();
+    if (lowerSegment.startsWith('.')) return false; // Hidden files/folders.
+    if (_ignoredArchiveDirectories.contains(lowerSegment)) return false;
+  }
+
+  final String fileName = segments.last;
+  final String lowerFileName = fileName.toLowerCase();
+  if (_ignoredArchiveMetadataFiles.contains(lowerFileName)) return false;
+
+  final int extensionStart = lowerFileName.lastIndexOf('.');
+  if (extensionStart <= 0) return false;
+  final String extension = lowerFileName.substring(extensionStart);
+  return _supportedPageExtensions.contains(extension);
 }
 
 final RegExp _chunkPattern = RegExp(r'\d+|\D+');

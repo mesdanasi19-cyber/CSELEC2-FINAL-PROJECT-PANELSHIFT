@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -14,41 +15,88 @@
 #include <utility>
 #include <vector>
 
-// NOTE: this path points into a Windows temp folder and will break on any other
-// machine / clean checkout. Move panel_postprocess.h next to this file and use
-// #include "panel_postprocess.h" instead.
+// panel_postprocess.h (nms / filter_geometry / merge_fragments / sort_reading_order).
+// Preferred layout: keep the header NEXT TO THIS FILE, it is then picked up
+// automatically. The old Windows temp-folder path is kept only as a fallback so
+// existing builds keep working; it breaks on any other machine / clean checkout,
+// so once the header has been moved the #else branch can be deleted.
+#if __has_include("panel_postprocess.h")
+#include "panel_postprocess.h"
+#else
 #include "../../../../../../Users/USER/AppData/Local/Temp/panel_postprocess.h"
+#endif
 
 #define LOG_TAG "PanelShiftYolo"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Build with -DPANELSHIFT_PROFILE to log per-stage timings (ms) for every page.
+// Build with -DPANELSHIFT_PROFILE to log per-stage timings (ms) AND how many boxes
+// survive each stage, for every page. That second line is the tool for tuning the
+// thresholds below on real pages (see "stages raw=... final=..." in the log).
 #ifdef PANELSHIFT_PROFILE
 #define PS_TICK(name) const int64 name = cv::getTickCount()
 #define PS_MS(a, b) (static_cast<double>((b) - (a)) * 1000.0 / cv::getTickFrequency())
+#define PS_COUNT(name, expr) const size_t name = (expr)
 #else
 #define PS_TICK(name) ((void)0)
+#define PS_COUNT(name, expr) ((void)0)
 #endif
+
+// Pipeline (everything runs on the page stretched to 640x640; boxes are 0..1):
+//   resize -> pack CHW blob -> forward -> raw detections (> kConfThreshold)
+//   -> nms -> filter_geometry -> merge_fragments -> flat-region check
+//   -> residue guard -> sort_reading_order
 
 namespace {
 
 // Model input edge. The model is fed the whole page stretched to 640x640 (as
 // before), so normalised output coordinates map 1:1 back onto the page.
 constexpr int kInputSize = 640;
+
+// ---- Thresholds ---------------------------------------------------------------
+// kConfThreshold and kMinStdDev were reviewed and DELIBERATELY left as they were:
+// where to put them depends on your model and your pages, and the right way to
+// move them is to build with PANELSHIFT_PROFILE and watch the per-stage counts.
+
+// Confidence a raw detection needs to enter post-processing at all. Raising it
+// removes weak artifacts but also weak REAL panels (borderless, bleeding off the
+// page), and a missed panel is story content the reader never zooms into, while
+// an extra box costs one spare stop. Lowering it hands merge_fragments more weak
+// pieces to reunite, at the price of more bubble / whitespace boxes.
 constexpr float kConfThreshold = 0.40f;
+
+// Minimum grey-level standard deviation (0..255) of a panel. Measured on the
+// 640px thumbnail, where fine texture is averaged out; if you see real panels
+// rejected, lower this a little (e.g. 12).
+// What this check can and cannot do: 15 is roughly "at least ~0.35% black ink on
+// white paper" (std = 255 * sqrt(p * (1 - p))), far above scan / JPEG noise and far
+// below any real content, so it removes genuinely BLANK boxes (whitespace). It can
+// not reject speech bubbles or captions: text plus outline is high-contrast. Those
+// are a job for NMS / geometry (panel_postprocess.h), not for this number.
+constexpr double kMinStdDev = 15.0;
+
+// If everything that survives covers less than this share of the page, it is
+// almost certainly residue (a lone bubble, caption or logo on a title / recap
+// page) and the whole page is returned as one panel instead of zooming into it.
+// Overlaps are counted twice, which can only make this trigger less often. Set to
+// 0.0f to disable.
+constexpr float kMinPageCoverage = 0.15f;
+
+// Hard cap on detections handed to NMS (highest confidence win). A normal page
+// yields a few dozen, so this never triggers there and its candidate list is
+// untouched. It only matters when the model fires on thousands of anchors (a blank
+// or very noisy page): the stages after it are quadratic in the worst case, and
+// this keeps their cost bounded whatever the model emits.
+constexpr int kMaxCandidates = 1000;
+
+// ---- Limits & platform --------------------------------------------------------
 
 // Sanity limits for the caller's buffer and the model output. Anything outside
 // them is treated as a failure and answered with the full-page fallback.
 constexpr int kMaxImageEdge = 16384;
 constexpr int kMaxAnchors = 100000;
 
-// Minimum grey-level standard deviation (0..255) of a panel. Measured on the
-// 640px thumbnail, where fine texture is averaged out; if you see real panels
-// rejected, lower this a little (e.g. 12).
-constexpr double kMinStdDev = 15.0;
-
-// The pixels handed in are RGB. The old code asked blobFromImage to swap R and
+// The pixels handed in are RGB(A). The old code asked blobFromImage to swap R and
 // B on an image that was already RGB, i.e. it fed the network BGR. Ultralytics
 // models expect RGB. Set to true only if your model was trained on BGR input.
 constexpr bool kSwapRB = false;
@@ -61,19 +109,47 @@ constexpr bool kSwapRB = false;
 // PANELSHIFT_PROFILE before changing (try 2 and 4). 0 = leave OpenCV's default.
 constexpr int kDnnThreads = 4;
 
+// A detection as it came out of the model (normalised and clamped). A plain
+// struct of our own, so the candidate cap below does not depend on how
+// panelshift::Box names its confidence member.
+struct RawDetection {
+    float x0, y0, x1, y1, conf;
+};
+
+// ---- Shared state & thread-safety audit ---------------------------------------
+// Every object below is read and written ONLY while g_mutex is held:
+//  * initYoloModel() and process_comic_panels() both take the lock first;
+//  * Net::forward() runs under the lock and its result (a view into the net's own
+//    output buffer, valid until the next forward()) is fully consumed before the
+//    lock is released. No pointer into g_blob / g_small_rgba / g_gray or into the
+//    net's output ever leaves a locked section; the caller-owned out_rects is the
+//    only thing handed back.
+// Nothing is thread_local and nothing is freed by hand: the Mats own their memory
+// (reference counted by OpenCV) and live until process exit, so there is no raw
+// owning pointer to leak.
 std::mutex g_mutex;                    // serialises init + inference (Net is not thread-safe)
 std::unique_ptr<cv::dnn::Net> g_net;   // guarded by g_mutex
 
-// Buffers reused by every call (all guarded by g_mutex). OpenCV only
-// reallocates a Mat when its size/type changes, and every buffer below is
-// always 640x640 with the same type, so after the first page there is no
-// per-page heap allocation for the intermediates and nothing to fragment.
-cv::Mat g_blob;        // 1x3x640x640 float input tensor
-cv::Mat g_small_rgba;  // 640x640 RGBA, resized page
-cv::Mat g_rgb;         // 640x640 RGB
-cv::Mat g_gray;        // 640x640 grey thumbnail for the flat-region check
-std::vector<panelshift::Box> g_candidates;  // capacity kept between calls
-std::vector<panelshift::Box> g_textured;    // capacity kept between calls
+// Buffers reused by every call. They are always 640x640 with the same type, and
+// OpenCV only reallocates a Mat when its size / type changes, so after warm-up
+// these three (6.96 MB in total) are never allocated again:
+//   g_blob        1x3x640x640 float input tensor            4.92 MB
+//   g_small_rgba  640x640 RGBA, the resized page            1.64 MB
+//   g_gray        640x640 grey thumbnail, flat-region check 0.41 MB
+// Compared with the previous version this drops the 1.23 MB g_rgb buffer AND the
+// temporary float image blobFromImage builds on every call: it converts the whole
+// image to a fresh CV_32F Mat before filling the blob (one call peaks at about
+// twice the blob's size; measured with OpenCV 5.0 on desktop), i.e. ~4.9 MB
+// allocated and freed on every page. Peak during pre-processing falls from
+// ~13.1 MB to ~7.0 MB, with no per-page allocation left for the big buffers.
+// What still allocates per page are a few small std::vectors (a few KB each)
+// here and inside panel_postprocess; not worth pooling, and nms() takes its
+// input by value, so a "pooled" candidate vector lost its buffer on every call
+// anyway.
+cv::Mat g_blob;
+cv::Mat g_small_rgba;
+cv::Mat g_gray;
+std::vector<RawDetection> g_raw;  // capacity kept between calls
 
 inline float clamp01(float v) { return std::max(0.0f, std::min(1.0f, v)); }
 inline int clampi(int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); }
@@ -87,6 +163,39 @@ int write_full_page(float* out_rects, int max_panels) {
     out_rects[2] = 1.0f;
     out_rects[3] = 1.0f;
     return 1;
+}
+
+// One image row: RGBA bytes in, three float planes out, scaled to 0..1. This is the
+// same arithmetic as blobFromImage (u8 * float(1/255)) and, for the default
+// kSwapRB=false, gives the network exactly the values it received before.
+// __restrict tells the compiler the source and the three planes never overlap,
+// which is what lets it vectorise the loop (NEON on arm64) instead of assuming
+// that every float store might write into the source bytes.
+inline void pack_row(const uint8_t* __restrict src, float* __restrict c0,
+                     float* __restrict c1, float* __restrict c2, int n) {
+    constexpr float kScale = static_cast<float>(1.0 / 255.0);
+    constexpr int kSrc0 = kSwapRB ? 2 : 0;  // source channel for plane 0
+    constexpr int kSrc2 = kSwapRB ? 0 : 2;  // source channel for plane 2
+    for (int x = 0; x < n; ++x) {
+        const uint8_t* p = src + 4 * x;
+        c0[x] = static_cast<float>(p[kSrc0]) * kScale;
+        c1[x] = static_cast<float>(p[1]) * kScale;
+        c2[x] = static_cast<float>(p[kSrc2]) * kScale;
+    }
+}
+
+// Packs the 640x640 RGBA thumbnail into the 1x3x640x640 CHW float blob in ONE pass
+// and without temporaries (alpha is ignored, as the old RGBA2RGB did).
+void pack_input_blob(const cv::Mat& rgba, cv::Mat& blob) {
+    constexpr int kPlane = kInputSize * kInputSize;
+    const int sizes[4] = {1, 3, kInputSize, kInputSize};
+    blob.create(4, sizes, CV_32F);  // no-op once the blob has this shape
+    float* const plane0 = reinterpret_cast<float*>(blob.data);
+    for (int y = 0; y < kInputSize; ++y) {
+        const size_t row = static_cast<size_t>(y) * kInputSize;
+        pack_row(rgba.ptr<uint8_t>(y), plane0 + row, plane0 + kPlane + row,
+                 plane0 + 2 * kPlane + row, kInputSize);
+    }
 }
 
 }  // namespace
@@ -121,16 +230,14 @@ int initYoloModel(const char* model_path_cstr) {
         net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
 
         // Allocate the pooled buffers now (and warm the net with the same
-        // shapes), so the first real page pays no allocation cost either.
+        // shapes and the same packing code), so the first real page pays no
+        // allocation cost either.
         g_small_rgba.create(kInputSize, kInputSize, CV_8UC4);
-        g_rgb.create(kInputSize, kInputSize, CV_8UC3);
         g_gray.create(kInputSize, kInputSize, CV_8UC1);
-        g_candidates.reserve(256);
-        g_textured.reserve(64);
+        g_raw.reserve(256);
 
-        g_rgb.setTo(cv::Scalar(255, 255, 255));
-        cv::dnn::blobFromImage(g_rgb, g_blob, 1.0 / 255.0, cv::Size(kInputSize, kInputSize),
-                               cv::Scalar(), kSwapRB, false, CV_32F);
+        g_small_rgba.setTo(cv::Scalar(255, 255, 255, 255));
+        pack_input_blob(g_small_rgba, g_blob);
         net.setInput(g_blob);
         net.forward();  // warm-up
 
@@ -185,18 +292,15 @@ int process_comic_panels(
         PS_TICK(t0);
 
         // --- Pre-processing: ONE resize straight from the caller's buffer into a
-        // pooled 640x640 RGBA buffer, then ONE colour conversion into a pooled RGB
-        // buffer. INTER_AREA is the right filter for shrinking; INTER_LINEAR if we
-        // have to enlarge.
+        // pooled 640x640 RGBA buffer, then ONE pass that packs it into the pooled
+        // CHW float blob. INTER_AREA is the right filter for shrinking; INTER_LINEAR
+        // if we have to enlarge. (The Dart side decodes to at most 640px on the
+        // long edge, so in practice the short edge is enlarged.)
         const cv::Mat frame(height, width, CV_8UC4, pixel_data);  // header only, no copy
         const int interpolation =
             (width >= kInputSize && height >= kInputSize) ? cv::INTER_AREA : cv::INTER_LINEAR;
         cv::resize(frame, g_small_rgba, cv::Size(kInputSize, kInputSize), 0, 0, interpolation);
-        cv::cvtColor(g_small_rgba, g_rgb, cv::COLOR_RGBA2RGB);
-
-        // Already 640x640, so blobFromImage only scales to 0..1 (into g_blob's memory).
-        cv::dnn::blobFromImage(g_rgb, g_blob, 1.0 / 255.0, cv::Size(kInputSize, kInputSize),
-                               cv::Scalar(), kSwapRB, false, CV_32F);
+        pack_input_blob(g_small_rgba, g_blob);
         PS_TICK(t1);
 
         g_net->setInput(g_blob);
@@ -207,6 +311,9 @@ int process_comic_panels(
         // [1, anchors, 4+nc]. Rows 0..3 are cx, cy, w, h in 640px model space;
         // rows 4.. are class scores (one row for a single-class panel model).
         // Every mismatch bails out right here, before any pointer is formed.
+        // (If the model ever gets a second class, e.g. speech bubbles, the max over
+        // all class rows below would report bubbles as panels: read only the panel
+        // class's row instead.)
         if (output.empty() || output.dims != 3 || output.depth() != CV_32F || output.size[0] != 1) {
             LOGE("Unexpected detection tensor (dims=%d). Falling back to full page.", output.dims);
             return write_full_page(out_rects, max_panels);
@@ -237,7 +344,7 @@ int process_comic_panels(
             return data[static_cast<size_t>(r) * stride_r + static_cast<size_t>(c) * stride_c];
         };
 
-        g_candidates.clear();  // keeps capacity: no reallocation after warm-up
+        g_raw.clear();  // keeps capacity: no reallocation after warm-up
         const float inv_input = 1.0f / static_cast<float>(kInputSize);
         for (int i = 0; i < cols; ++i) {
             float confidence = at(4, i);
@@ -254,29 +361,49 @@ int process_comic_panels(
             const float y0 = clamp01((cy - 0.5f * h) * inv_input);
             const float x1 = clamp01((cx + 0.5f * w) * inv_input);
             const float y1 = clamp01((cy + 0.5f * h) * inv_input);
-            g_candidates.push_back(panelshift::Box{x0, y0, x1 - x0, y1 - y0, confidence});
+            // Clamping can collapse a box that lies outside the page to zero area.
+            // Such a box can never be a panel and would only feed 0/0 into IoU.
+            if (!(x1 > x0) || !(y1 > y0)) continue;
+            g_raw.push_back(RawDetection{x0, y0, x1, y1, confidence});
+        }
+
+        // Bound the worst case of the stages below (see kMaxCandidates). A no-op on
+        // normal pages, so their candidate list is exactly what it was before.
+        if (g_raw.size() > static_cast<size_t>(kMaxCandidates)) {
+            std::nth_element(g_raw.begin(), g_raw.begin() + kMaxCandidates, g_raw.end(),
+                             [](const RawDetection& a, const RawDetection& b) { return a.conf > b.conf; });
+            g_raw.erase(g_raw.begin() + kMaxCandidates, g_raw.end());
+        }
+        PS_COUNT(n_raw, g_raw.size());
+
+        std::vector<panelshift::Box> candidates;
+        candidates.reserve(g_raw.size());  // one exact-size allocation, a few KB
+        for (const RawDetection& d : g_raw) {
+            candidates.push_back(panelshift::Box{d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0, d.conf});
         }
 
         // --- Post-processing (see panel_postprocess.h) --------------------------
         panelshift::Params params;
         params.page_aspect = static_cast<float>(width) / static_cast<float>(height);
 
-        // nms takes its input by value: move the pooled vector in (its buffer goes
-        // with it, and is re-reserved below only when it was actually consumed).
-        std::vector<panelshift::Box> boxes = panelshift::nms(std::move(g_candidates), params);
-        g_candidates.clear();
-        if (g_candidates.capacity() < 256) g_candidates.reserve(256);
+        std::vector<panelshift::Box> boxes = panelshift::nms(std::move(candidates), params);
+        PS_COUNT(n_nms, boxes.size());
         boxes = panelshift::filter_geometry(boxes, params);
+        PS_COUNT(n_geometry, boxes.size());
         boxes = panelshift::merge_fragments(std::move(boxes), params);
+        PS_COUNT(n_merged, boxes.size());
 
         // Flat-region check, AFTER merging: a flat fragment of a real panel is
         // absorbed into it first, instead of being dropped and leaving a hole.
-        // It runs on views into ONE pooled 640px grey thumbnail.
+        // It runs on views into ONE pooled 640px grey thumbnail (made from the RGBA
+        // thumbnail directly: same grey values as the old RGB route) and compacts
+        // the box list in place, so there is no second vector and no copy back.
         if (!boxes.empty()) {
-            cv::cvtColor(g_rgb, g_gray, cv::COLOR_RGB2GRAY);
+            cv::cvtColor(g_small_rgba, g_gray, cv::COLOR_RGBA2GRAY);
 
-            g_textured.clear();
-            for (const panelshift::Box& b : boxes) {
+            size_t kept = 0;
+            for (size_t i = 0; i < boxes.size(); ++i) {
+                const panelshift::Box b = boxes[i];  // copy: boxes[kept] may overwrite boxes[i]
                 const int x0 = clampi(static_cast<int>(std::floor(b.x * kInputSize)), 0, kInputSize - 1);
                 const int y0 = clampi(static_cast<int>(std::floor(b.y * kInputSize)), 0, kInputSize - 1);
                 const int x1 = clampi(static_cast<int>(std::ceil(b.right() * kInputSize)), x0 + 1, kInputSize);
@@ -284,14 +411,31 @@ int process_comic_panels(
 
                 cv::Scalar mean, stddev;
                 cv::meanStdDev(g_gray(cv::Rect(x0, y0, x1 - x0, y1 - y0)), mean, stddev);
-                if (stddev[0] >= kMinStdDev) g_textured.push_back(b);
+                if (stddev[0] >= kMinStdDev) {
+                    boxes[kept++] = b;
+                } else {
+#ifdef PANELSHIFT_PROFILE
+                    LOGI("flat box dropped: std=%.1f area=%.3f", stddev[0],
+                         static_cast<double>(b.w * b.h));
+#endif
+                }
             }
-            boxes.assign(g_textured.begin(), g_textured.end());
+            boxes.erase(boxes.begin() + static_cast<std::ptrdiff_t>(kept), boxes.end());
         }
+        PS_COUNT(n_textured, boxes.size());
 
-        // DYNAMIC FALLBACK FOR COVERS & RECAP PAGES: nothing valid left, so the
-        // whole page is one panel instead of leaving it empty.
-        if (boxes.empty()) {
+        // DYNAMIC FALLBACK FOR COVERS & RECAP PAGES: nothing valid left, or only
+        // residue that covers a sliver of the page (see kMinPageCoverage), so the
+        // whole page is one panel instead of leaving it empty or zooming into an
+        // artifact.
+        float covered = 0.0f;
+        for (const panelshift::Box& b : boxes) covered += b.w * b.h;
+        if (boxes.empty() || covered < kMinPageCoverage) {
+#ifdef PANELSHIFT_PROFILE
+            if (!boxes.empty()) LOGI("residue guard: %zu box(es) cover only %.3f of the page", boxes.size(),
+                                     static_cast<double>(covered));
+#endif
+            boxes.clear();
             boxes.push_back(panelshift::Box{0.0f, 0.0f, 1.0f, 1.0f, 1.0f});
         }
 
@@ -309,6 +453,8 @@ int process_comic_panels(
         PS_TICK(t3);
         LOGI("panels=%d  input=%dx%d  pre=%.1fms  forward=%.1fms  post=%.1fms",
              panel_count, width, height, PS_MS(t0, t1), PS_MS(t1, t2), PS_MS(t2, t3));
+        LOGI("stages raw=%zu nms=%zu geometry=%zu merged=%zu textured=%zu final=%d",
+             n_raw, n_nms, n_geometry, n_merged, n_textured, panel_count);
 #else
         LOGI("YOLO extracted %d comic panels.", panel_count);
 #endif

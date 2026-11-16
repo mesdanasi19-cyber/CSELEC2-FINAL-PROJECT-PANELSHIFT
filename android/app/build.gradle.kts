@@ -30,8 +30,7 @@ android {
         versionName = flutter.versionName
 
         ndk {
-            abiFilters.clear()
-            abiFilters.add("arm64-v8a")
+            abiFilters.add("armeabi-v7a")
         }
 
         externalNativeBuild {
@@ -42,9 +41,6 @@ android {
                     "-DOpenCV_DIR=C:/deps/opencv_android/sdk/native/jni"
                 )
             }
-        }
-        ndk {
-            abiFilters.addAll(setOf("arm64-v8a"))
         }
     }
 

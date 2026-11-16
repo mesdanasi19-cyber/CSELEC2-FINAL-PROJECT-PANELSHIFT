@@ -16,13 +16,15 @@ import 'screens/comic_reader_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Orphan cleanup is pure disk I/O. Started before the first frame it competes
+  // with the library's cover reads on slow flash storage, so it waits until the
+  // UI has settled.
   unawaited(
-    ComicCacheService.instance.purgeOrphans().catchError((
-      Object error,
-      StackTrace st,
-    ) {
-      debugPrint('PanelShift cache cleanup failed: $error');
-    }),
+    Future<void>.delayed(const Duration(seconds: 4))
+        .then<void>((_) => ComicCacheService.instance.purgeOrphans())
+        .catchError((Object error, StackTrace st) {
+          debugPrint('PanelShift cache cleanup failed: $error');
+        }),
   );
   runApp(const PanelShiftApp());
 }
@@ -152,6 +154,8 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   void dispose() {
     ComicLibraryService.libraryChanges.removeListener(_loadLibrary);
     ReadingProgressService.changes.removeListener(_refreshReadTimes);
+    // A scroll that is cut short by navigation never reports its end.
+    ComicCoverService.instance.setScrolling(false);
     _searchController.dispose();
     _gridScroll.dispose();
     _listScroll.dispose();
@@ -1060,9 +1064,28 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     );
   }
 
-  /// Wraps a scroll view with the painted bookshelf (when enabled). The layer
-  /// is always present in the tree so toggling the mode never rebuilds the
-  /// scroll view's state or resets its position.
+  /// Parks cover generation while the library scrolls (see
+  /// [ComicCoverService.setScrolling]) so archive extraction never competes
+  /// with the UI/raster threads during a fling.
+  bool _onLibraryScroll(ScrollNotification notification) {
+    if (notification.depth != 0) return false;
+    if (notification is ScrollStartNotification) {
+      ComicCoverService.instance.setScrolling(true);
+    } else if (notification is ScrollEndNotification) {
+      ComicCoverService.instance.setScrolling(false);
+    }
+    return false;
+  }
+
+  /// Wraps a scroll view with the painted bookshelf (when enabled). The
+  /// backdrop slot is always present in the tree so toggling the mode never
+  /// rebuilds the scroll view's state or resets its position.
+  ///
+  /// Layer plan (each arrow is a separate compositor layer):
+  ///   wall (static)  ->  planks (repaints per scroll tick)  ->  scroll view
+  /// The scroll view gets its own RepaintBoundary: it repaints on every scroll
+  /// tick, and without a boundary that repaint would dirty the route layer the
+  /// app bar, search field and banners share.
   Widget _withShelves({
     required bool bookshelf,
     required ScrollController controller,
@@ -1076,23 +1099,24 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
       children: [
         Positioned.fill(
           child: bookshelf
-              ? RepaintBoundary(
-                  child: CustomPaint(
-                    painter: _BookshelfPainter(
-                      scroll: controller,
-                      palette: theme.brightness == Brightness.dark
-                          ? _ShelfPalette.dark
-                          : _ShelfPalette.light,
-                      rowCount: rowCount,
-                      topInset: layout.topInset,
-                      rowStride: layout.rowStride,
-                      bookBottom: layout.bookBottom,
-                    ),
-                  ),
+              ? _ShelfBackdrop(
+                  scroll: controller,
+                  palette: theme.brightness == Brightness.dark
+                      ? _ShelfPalette.dark
+                      : _ShelfPalette.light,
+                  rowCount: rowCount,
+                  topInset: layout.topInset,
+                  rowStride: layout.rowStride,
+                  bookBottom: layout.bookBottom,
                 )
               : const SizedBox.shrink(),
         ),
-        scrollView,
+        RepaintBoundary(
+          child: NotificationListener<ScrollNotification>(
+            onNotification: _onLibraryScroll,
+            child: scrollView,
+          ),
+        ),
       ],
     );
   }
@@ -1125,6 +1149,10 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
               mainAxisExtent: layout.cellHeight,
             ),
             itemCount: _visible.length,
+            // Tiles never keep themselves alive, so skip the per-item
+            // AutomaticKeepAlive wrapper; every tile is its own repaint layer.
+            addAutomaticKeepAlives: false,
+            addRepaintBoundaries: true,
             itemBuilder: (BuildContext context, int index) {
               final ComicIdentity comic = _visible[index];
               return _ComicEntry(
@@ -1162,6 +1190,8 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
             padding: layout.padding,
             itemExtent: layout.cellHeight,
             itemCount: _visible.length,
+            addAutomaticKeepAlives: false,
+            addRepaintBoundaries: true,
             itemBuilder: (BuildContext context, int index) {
               final ComicIdentity comic = _visible[index];
               return _ComicEntry(
@@ -1419,6 +1449,22 @@ class _ComicEntryState extends State<_ComicEntry> {
 
   // --- cover ----------------------------------------------------------------
 
+  /// Hard ceiling for a cover bitmap's decoded width (== the width
+  /// [ComicCoverService] stores). Never exceeded, whatever the tile size.
+  static const int _kCoverDecodeCeiling = 480;
+
+  /// Decode width for one tile: its physical pixel width, clamped to
+  /// [96, _kCoverDecodeCeiling]. A 3-column grid on a 1080 px phone decodes at
+  /// ~360 px (0.7 MB per cover) and a list thumbnail at ~200 px, instead of
+  /// 480 px (1.4 MB) everywhere - the ImageCache holds up to twice as many covers
+  /// for the same RAM. With unbounded constraints the ceiling applies.
+  int _coverDecodeWidth(BuildContext context, BoxConstraints constraints) {
+    final double logical = constraints.maxWidth;
+    if (!logical.isFinite || logical <= 0) return _kCoverDecodeCeiling;
+    final double dpr = MediaQuery.devicePixelRatioOf(context);
+    return (logical * dpr).ceil().clamp(96, _kCoverDecodeCeiling).toInt();
+  }
+
   Widget _buildCover(
     BuildContext context,
     ComicCover? cover, {
@@ -1432,24 +1478,31 @@ class _ComicEntryState extends State<_ComicEntry> {
     );
 
     if (cover != null) {
-      return Image.file(
-        File(cover.path),
-        fit: BoxFit.cover,
-        alignment: Alignment.topCenter,
-        cacheWidth: 480,
-        filterQuality: FilterQuality.medium,
-        gaplessPlayback: true,
-        frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-          if (wasSynchronouslyLoaded) return child;
-          return AnimatedOpacity(
-            opacity: frame == null ? 0 : 1,
-            duration: const Duration(milliseconds: 180),
-            child: child,
+      return LayoutBuilder(
+        builder: (BuildContext context, BoxConstraints constraints) {
+          return Image.file(
+            File(cover.path),
+            fit: BoxFit.cover,
+            alignment: Alignment.topCenter,
+            // Strictly bounded decode (<= 480 px wide, normally the tile's own
+            // pixel width). The bitmap is already ~tile-sized, so bilinear is
+            // enough: FilterQuality.medium would add a mipmap pass per cover.
+            cacheWidth: _coverDecodeWidth(context, constraints),
+            filterQuality: FilterQuality.low,
+            gaplessPlayback: true,
+            frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+              if (wasSynchronouslyLoaded) return child;
+              return AnimatedOpacity(
+                opacity: frame == null ? 0 : 1,
+                duration: const Duration(milliseconds: 180),
+                child: child,
+              );
+            },
+            errorBuilder: (context, error, stackTrace) => placeholder(
+              Icon(Icons.broken_image_outlined, color: scheme.onSurfaceVariant),
+            ),
           );
         },
-        errorBuilder: (context, error, stackTrace) => placeholder(
-          Icon(Icons.broken_image_outlined, color: scheme.onSurfaceVariant),
-        ),
       );
     }
 
@@ -1955,21 +2008,25 @@ class _ShelfPalette {
   );
 }
 
-/// Paints the bookcase behind the scroll view: back panel, a polished wooden
-/// plank under every row (plus empty shelves to fill the screen when the
-/// library is short) and the shadows each plank casts. It follows
-/// [scroll] directly, so it stays glued to the rows while scrolling and only
-/// the visible planks are ever drawn, no matter how large the library gets.
-class _BookshelfPainter extends CustomPainter {
-  _BookshelfPainter({
+/// The bookcase behind the scroll view, split into two retained layers so a
+/// scroll tick only ever repaints the part that really moves:
+///
+///  1. [_ShelfWallPainter] - back panel, seams and side shading. It is fixed to
+///     the viewport and independent of the scroll offset, so it is painted once
+///     per size/theme and afterwards only composited.
+///  2. [_BookshelfPainter] - the planks and the shadows they cast. It follows
+///     the scroll controller and draws only the visible planks, reusing the
+///     cached paints, shaders and grain paths of a [_PlankKit] instead of
+///     rebuilding them every frame.
+class _ShelfBackdrop extends StatelessWidget {
+  const _ShelfBackdrop({
     required this.scroll,
     required this.palette,
     required this.rowCount,
     required this.topInset,
     required this.rowStride,
     required this.bookBottom,
-    this.fillEmptyShelves = true,
-  }) : super(repaint: scroll);
+  });
 
   final ScrollController scroll;
   final _ShelfPalette palette;
@@ -1977,35 +2034,51 @@ class _BookshelfPainter extends CustomPainter {
   final double topInset;
   final double rowStride;
   final double bookBottom;
-  final bool fillEmptyShelves;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      fit: StackFit.expand,
+      children: <Widget>[
+        // Layer 1: static wall. No repaint listenable, so after its first paint
+        // it is never re-recorded while the library scrolls.
+        RepaintBoundary(
+          child: CustomPaint(
+            isComplex: true,
+            painter: _ShelfWallPainter(palette: palette),
+          ),
+        ),
+        // Layer 2: only the planks move with the scroll offset.
+        RepaintBoundary(
+          child: CustomPaint(
+            willChange: true,
+            painter: _BookshelfPainter(
+              scroll: scroll,
+              palette: palette,
+              rowCount: rowCount,
+              topInset: topInset,
+              rowStride: rowStride,
+              bookBottom: bookBottom,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Back panel of the bookcase. Viewport-fixed, so it never listens to the
+/// scroll controller; it repaints only when the size or the palette changes.
+class _ShelfWallPainter extends CustomPainter {
+  const _ShelfWallPainter({required this.palette});
+
+  final _ShelfPalette palette;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final double offset = scroll.positions.isEmpty
-        ? 0.0
-        : scroll.positions.last.pixels;
-
-    _paintWall(canvas, size);
-    if (rowStride <= 0) return;
-
-    // Content-space Y of the first plank's top edge.
-    final double firstTop = topInset + bookBottom - _ShelfDims.plankBehindBook;
-    final double reach = _ShelfDims.plankHeight + _ShelfDims.castShadow;
-
-    int first = ((offset - firstTop - reach) / rowStride).floor();
-    int last = ((offset + size.height - firstTop) / rowStride).ceil();
-    first = math.max(first, 0);
-    if (!fillEmptyShelves) last = math.min(last, rowCount - 1);
-
-    for (int i = first; i <= last; i++) {
-      _paintPlank(canvas, size.width, firstTop + i * rowStride - offset, i);
-    }
-  }
-
-  void _paintWall(Canvas canvas, Size size) {
     canvas.drawRect(Offset.zero & size, Paint()..color = palette.wall);
 
-    // Vertical back-board seams (vertical lines, so they can stay static).
+    // Vertical back-board seams.
     final Paint seam = Paint()
       ..color = palette.wallSeam
       ..strokeWidth = 1;
@@ -2041,145 +2114,58 @@ class _BookshelfPainter extends CustomPainter {
     );
   }
 
-  void _paintPlank(Canvas canvas, double w, double top, int index) {
-    final math.Random rnd = math.Random(index * 7919 + 101);
-    final Rect surface = Rect.fromLTWH(0, top, w, _ShelfDims.plankSurface);
-    final Rect face = Rect.fromLTWH(
-      0,
-      surface.bottom,
-      w,
-      _ShelfDims.plankFace,
-    );
-    final Rect whole = Rect.fromLTRB(0, top, w, face.bottom);
+  @override
+  bool shouldRepaint(covariant _ShelfWallPainter old) => old.palette != palette;
+}
 
-    // 1. Shadow thrown on the back panel below the plank.
-    final Rect shadow = Rect.fromLTWH(
-      0,
-      face.bottom,
-      w,
-      _ShelfDims.castShadow,
-    );
-    canvas.drawRect(
-      shadow,
-      Paint()
-        ..shader = LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [
-            Colors.black.withAlpha(160),
-            Colors.black.withAlpha(55),
-            Colors.black.withAlpha(0),
-          ],
-          stops: const [0.0, 0.4, 1.0],
-        ).createShader(shadow),
-    );
+/// Paints a wooden plank under every visible row (plus empty shelves to fill
+/// the screen when the library is short) and the shadows each plank casts. It
+/// follows [scroll] directly, so it stays glued to the rows while scrolling and
+/// only the visible planks are ever drawn, no matter how large the library is.
+///
+/// Per frame this does no allocation-heavy work: every gradient shader, stroke
+/// paint and grain path lives in the shared [_PlankKit], and a plank is drawn
+/// by translating the canvas to its row and replaying 12 cheap operations.
+class _BookshelfPainter extends CustomPainter {
+  _BookshelfPainter({
+    required this.scroll,
+    required this.palette,
+    required this.rowCount,
+    required this.topInset,
+    required this.rowStride,
+    required this.bookBottom,
+    this.fillEmptyShelves = true,
+  }) : super(repaint: scroll);
 
-    // 2. Top surface (lighter toward the front edge) with grain.
-    canvas.drawRect(
-      surface,
-      Paint()
-        ..shader = LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [palette.surfaceBack, palette.surfaceFront],
-        ).createShader(surface),
-    );
-    _paintGrain(canvas, surface, rnd, math.max(8, (w / 26).round()));
+  final ScrollController scroll;
+  final _ShelfPalette palette;
+  final int rowCount;
+  final double topInset;
+  final double rowStride;
+  final double bookBottom;
+  final bool fillEmptyShelves;
 
-    // Dark contact line where the surface meets the back panel.
-    final Rect occlusion = Rect.fromLTWH(0, top, w, 5);
-    canvas.drawRect(
-      occlusion,
-      Paint()
-        ..shader = LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [Colors.black.withAlpha(120), Colors.black.withAlpha(0)],
-        ).createShader(occlusion),
-    );
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (rowStride <= 0 || size.isEmpty) return;
 
-    // 3. Front face with grain, bevel highlight and lower edge shade.
-    canvas.drawRect(
-      face,
-      Paint()
-        ..shader = LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [palette.faceTop, palette.faceBottom],
-        ).createShader(face),
-    );
-    _paintGrain(canvas, face, rnd, math.max(10, (w / 16).round()));
-    canvas.drawRect(
-      Rect.fromLTWH(0, face.top, w, 1.5),
-      Paint()..color = palette.highlight,
-    );
-    canvas.drawRect(
-      Rect.fromLTWH(0, face.bottom - 2, w, 2),
-      Paint()..color = Colors.black.withAlpha(130),
-    );
+    final double offset = scroll.positions.isEmpty
+        ? 0.0
+        : scroll.positions.last.pixels;
+    final _PlankKit kit = _PlankKit.obtain(palette, size.width);
 
-    // 4. Polished sheen: a soft specular streak along the front lip.
-    final Rect sheen = Rect.fromLTWH(0, face.top + 3, w, 3);
-    canvas.drawRect(
-      sheen,
-      Paint()
-        ..shader = LinearGradient(
-          colors: [
-            Colors.white.withAlpha(0),
-            Colors.white.withAlpha(46),
-            Colors.white.withAlpha(0),
-          ],
-          stops: const [0.0, 0.5, 1.0],
-        ).createShader(sheen),
-    );
+    // Content-space Y of the first plank's top edge.
+    final double firstTop = topInset + bookBottom - _ShelfDims.plankBehindBook;
+    final double reach = _ShelfDims.plankHeight + _ShelfDims.castShadow;
 
-    // 5. Slight darkening toward both ends of the plank.
-    canvas.drawRect(
-      whole,
-      Paint()
-        ..shader = LinearGradient(
-          colors: [
-            Colors.black.withAlpha(90),
-            Colors.black.withAlpha(0),
-            Colors.black.withAlpha(0),
-            Colors.black.withAlpha(90),
-          ],
-          stops: const [0.0, 0.05, 0.95, 1.0],
-        ).createShader(whole),
-    );
-  }
+    int first = ((offset - firstTop - reach) / rowStride).floor();
+    int last = ((offset + size.height - firstTop) / rowStride).ceil();
+    first = math.max(first, 0);
+    if (!fillEmptyShelves) last = math.min(last, rowCount - 1);
 
-  /// Long, slightly drifting grain streaks (two paths = two draw calls).
-  void _paintGrain(Canvas canvas, Rect r, math.Random rnd, int count) {
-    final Path dark = Path();
-    final Path light = Path();
-    for (int k = 0; k < count; k++) {
-      final double y = r.top + 0.5 + rnd.nextDouble() * math.max(r.height - 1, 0);
-      final double x0 = r.left - 40 + rnd.nextDouble() * (r.width + 40);
-      final double length = 50 + rnd.nextDouble() * r.width * 0.5;
-      final double drift = (rnd.nextDouble() - 0.5) * 2.5;
-      final Path target = k.isEven ? dark : light;
-      target.moveTo(x0, y);
-      target.quadraticBezierTo(x0 + length / 2, y + drift, x0 + length, y);
+    for (int i = first; i <= last; i++) {
+      kit.paint(canvas, firstTop + i * rowStride - offset, i);
     }
-
-    canvas.save();
-    canvas.clipRect(r);
-    canvas.drawPath(
-      dark,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 0.9
-        ..color = palette.grainDark,
-    );
-    canvas.drawPath(
-      light,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 0.7
-        ..color = palette.grainLight,
-    );
-    canvas.restore();
   }
 
   @override
@@ -2191,6 +2177,208 @@ class _BookshelfPainter extends CustomPainter {
         old.rowStride != rowStride ||
         old.bookBottom != bookBottom ||
         old.fillEmptyShelves != fillEmptyShelves;
+  }
+}
+
+/// Grain streaks of one plank surface or face (two paths = two draw calls).
+class _GrainPaths {
+  const _GrainPaths(this.dark, this.light);
+
+  final Path dark;
+  final Path light;
+}
+
+/// One pre-generated plank look: grain for the top surface and the front face.
+class _PlankGrain {
+  const _PlankGrain(this.surface, this.face);
+
+  final _GrainPaths surface;
+  final _GrainPaths face;
+}
+
+/// Everything a plank needs that does not change from frame to frame: the
+/// gradient shaders (built once for a plank whose top edge sits at y = 0),
+/// the stroke paints and a handful of grain variants.
+///
+/// A plank is drawn after `canvas.translate(0, top)`: shader coordinates follow
+/// the canvas transform, so the same shaders serve every row and every frame.
+/// The kit is rebuilt only when the width or the palette changes (rotation,
+/// theme switch). A single shared entry is enough: the grid and the list share
+/// one library width, and only one theme is active at a time.
+class _PlankKit {
+  _PlankKit._(this.palette, this.width) {
+    const double surfaceH = _ShelfDims.plankSurface;
+    const double faceH = _ShelfDims.plankFace;
+    final double w = width;
+
+    surfaceRect = Rect.fromLTWH(0, 0, w, surfaceH);
+    faceRect = Rect.fromLTWH(0, surfaceH, w, faceH);
+    wholeRect = Rect.fromLTWH(0, 0, w, surfaceH + faceH);
+    shadowRect = Rect.fromLTWH(0, surfaceH + faceH, w, _ShelfDims.castShadow);
+    occlusionRect = Rect.fromLTWH(0, 0, w, 5);
+    highlightRect = Rect.fromLTWH(0, surfaceH, w, 1.5);
+    edgeRect = Rect.fromLTWH(0, surfaceH + faceH - 2, w, 2);
+    sheenRect = Rect.fromLTWH(0, surfaceH + 3, w, 3);
+
+    // 1. Shadow thrown on the back panel below the plank.
+    shadowPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          Colors.black.withAlpha(160),
+          Colors.black.withAlpha(55),
+          Colors.black.withAlpha(0),
+        ],
+        stops: const [0.0, 0.4, 1.0],
+      ).createShader(shadowRect);
+
+    // 2. Top surface (lighter toward the front edge).
+    surfacePaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [palette.surfaceBack, palette.surfaceFront],
+      ).createShader(surfaceRect);
+
+    // Dark contact line where the surface meets the back panel.
+    occlusionPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [Colors.black.withAlpha(120), Colors.black.withAlpha(0)],
+      ).createShader(occlusionRect);
+
+    // 3. Front face, bevel highlight and lower edge shade.
+    facePaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [palette.faceTop, palette.faceBottom],
+      ).createShader(faceRect);
+    highlightPaint = Paint()..color = palette.highlight;
+    edgePaint = Paint()..color = Colors.black.withAlpha(130);
+
+    // 4. Polished sheen: a soft specular streak along the front lip.
+    sheenPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Colors.white.withAlpha(0),
+          Colors.white.withAlpha(46),
+          Colors.white.withAlpha(0),
+        ],
+        stops: const [0.0, 0.5, 1.0],
+      ).createShader(sheenRect);
+
+    // 5. Slight darkening toward both ends of the plank.
+    endsPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Colors.black.withAlpha(90),
+          Colors.black.withAlpha(0),
+          Colors.black.withAlpha(0),
+          Colors.black.withAlpha(90),
+        ],
+        stops: const [0.0, 0.05, 0.95, 1.0],
+      ).createShader(wholeRect);
+
+    grainDarkPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.9
+      ..color = palette.grainDark;
+    grainLightPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.7
+      ..color = palette.grainLight;
+
+    grains = List<_PlankGrain>.generate(_variantCount, (int v) {
+      final math.Random rnd = math.Random(v * 7919 + 101);
+      return _PlankGrain(
+        _buildGrain(surfaceRect, rnd, math.max(8, (w / 26).round())),
+        _buildGrain(faceRect, rnd, math.max(10, (w / 16).round())),
+      );
+    }, growable: false);
+  }
+
+  /// Distinct grain patterns. Rows pick one by index (stride 5 mod 8 scrambles
+  /// the order), so neighbouring planks never look alike.
+  static const int _variantCount = 8;
+
+  static _PlankKit? _current;
+
+  static _PlankKit obtain(_ShelfPalette palette, double width) {
+    final _PlankKit? kit = _current;
+    if (kit != null && identical(kit.palette, palette) && kit.width == width) {
+      return kit;
+    }
+    return _current = _PlankKit._(palette, width);
+  }
+
+  final _ShelfPalette palette;
+  final double width;
+
+  late final Rect surfaceRect;
+  late final Rect faceRect;
+  late final Rect wholeRect;
+  late final Rect shadowRect;
+  late final Rect occlusionRect;
+  late final Rect highlightRect;
+  late final Rect edgeRect;
+  late final Rect sheenRect;
+
+  late final Paint shadowPaint;
+  late final Paint surfacePaint;
+  late final Paint occlusionPaint;
+  late final Paint facePaint;
+  late final Paint highlightPaint;
+  late final Paint edgePaint;
+  late final Paint sheenPaint;
+  late final Paint endsPaint;
+  late final Paint grainDarkPaint;
+  late final Paint grainLightPaint;
+
+  late final List<_PlankGrain> grains;
+
+  /// Long, slightly drifting streaks in [r]'s local coordinates. Every streak
+  /// is kept inside [r] (the inset covers the curve's drift plus half the
+  /// stroke width), so no per-plank clipRect is needed at draw time.
+  static _GrainPaths _buildGrain(Rect r, math.Random rnd, int count) {
+    const double inset = 1.2;
+    final double usableHeight = math.max(r.height - 2 * inset, 0.0);
+    final Path dark = Path();
+    final Path light = Path();
+    for (int k = 0; k < count; k++) {
+      final double y = r.top + inset + rnd.nextDouble() * usableHeight;
+      final double length = math.min(50 + rnd.nextDouble() * r.width * 0.5, r.width);
+      final double x0 = r.left + rnd.nextDouble() * math.max(r.width - length, 0.0);
+      final double drift = (rnd.nextDouble() - 0.5) * 2.5;
+      final Path target = k.isEven ? dark : light;
+      target.moveTo(x0, y);
+      target.quadraticBezierTo(x0 + length / 2, y + drift, x0 + length, y);
+    }
+    return _GrainPaths(dark, light);
+  }
+
+  /// Draws the plank whose top edge is at [top] (canvas coordinates). The order
+  /// matches the original painter: shadow, surface + grain, contact line, face
+  /// + grain, highlight, lower edge, sheen, end darkening.
+  void paint(Canvas canvas, double top, int index) {
+    final _PlankGrain grain = grains[(index * 5) % _variantCount];
+    canvas.save();
+    canvas.translate(0.0, top);
+    canvas.drawRect(shadowRect, shadowPaint);
+    canvas.drawRect(surfaceRect, surfacePaint);
+    canvas.drawPath(grain.surface.dark, grainDarkPaint);
+    canvas.drawPath(grain.surface.light, grainLightPaint);
+    canvas.drawRect(occlusionRect, occlusionPaint);
+    canvas.drawRect(faceRect, facePaint);
+    canvas.drawPath(grain.face.dark, grainDarkPaint);
+    canvas.drawPath(grain.face.light, grainLightPaint);
+    canvas.drawRect(highlightRect, highlightPaint);
+    canvas.drawRect(edgeRect, edgePaint);
+    canvas.drawRect(sheenRect, sheenPaint);
+    canvas.drawRect(wholeRect, endsPaint);
+    canvas.restore();
   }
 }
 

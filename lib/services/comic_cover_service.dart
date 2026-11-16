@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -31,13 +32,40 @@ class ComicCover {
 ///  * For anything else, [request] generates the cover lazily through
 ///    [ComicParserService], one comic at a time (the RAR plugin is heavy), and
 ///    skips queued work that no visible card is waiting for any more.
+///  * Memory is bounded by WIDTH *and* AREA (see [_coverWidth] and
+///    [_coverMaxPixels]): whatever the page's aspect ratio, a stored cover
+///    decodes to at most ~1.5 MB of RGBA.
+///  * Generation is scroll-aware: while the library is being scrolled the queue
+///    parks ([setScrolling]), so archive extraction never competes with the
+///    UI/raster threads for CPU during a fling on a low-end phone.
 class ComicCoverService {
   ComicCoverService._();
   static final ComicCoverService instance = ComicCoverService._();
 
   static const String _folderName = 'panelshift_covers';
+
+  /// Hard ceiling for a stored cover's width. The library tile decodes with
+  /// `cacheWidth <= 480` as well (main.dart), so the file on disk and the
+  /// bitmap in the ImageCache obey the same bound.
   static const int _coverWidth = 480;
+
+  /// Second bound, on AREA: 480 x 800 px = 1.5 MB of decoded RGBA. A width-only
+  /// limit does not bound memory for tall pages: an 800 x 20000 strip scaled to
+  /// 480 wide is still 480 x 12000 = 23 MB once the grid decodes it. With both
+  /// limits every cover decodes to <= ~1.5 MB regardless of aspect ratio.
+  static const int _coverMaxPixels = _coverWidth * 800;
+
+  /// Minimum gap between two archive generations, so a burst of covers cannot
+  /// hold the CPU for several consecutive frames.
+  static const Duration _jobGap = Duration(milliseconds: 16);
+
+  /// Longest a queued generation waits for the library to stop scrolling. A
+  /// lost "scroll ended" signal therefore cannot stall the queue.
+  static const Duration _scrollWaitCeiling = Duration(seconds: 3);
+
   static const int _metaVersion = 1;
+
+  static final RegExp _unsafeChars = RegExp(r'[^A-Za-z0-9_-]');
 
   final Map<String, ComicCover> _memo = <String, ComicCover>{};
   final Map<String, Future<ComicCover?>> _inFlight =
@@ -52,6 +80,9 @@ class ComicCoverService {
 
   Future<Directory>? _dirFuture;
   Future<void> _queueTail = Future<void>.value();
+
+  /// Non-null while the library is scrolling; queued jobs wait on it.
+  Completer<void>? _scrollGate;
 
   // ---------------------------------------------------------------------------
   // Public API
@@ -89,6 +120,38 @@ class ComicCoverService {
     } else {
       _interest[comicId] = left;
     }
+  }
+
+  /// Tells the service whether the library list/grid is currently scrolling.
+  ///
+  /// Queued generations (archive extraction + decode + PNG encode) wait for the
+  /// scroll to stop instead of competing with the UI and raster threads for the
+  /// CPU. Work that is already running is never interrupted, and the wait is
+  /// bounded ([_scrollWaitCeiling]).
+  void setScrolling(bool scrolling) {
+    if (scrolling) {
+      _scrollGate ??= Completer<void>();
+      return;
+    }
+    final Completer<void>? gate = _scrollGate;
+    _scrollGate = null;
+    if (gate != null && !gate.isCompleted) gate.complete();
+  }
+
+  Future<void> _waitForScrollIdle() async {
+    final Completer<void>? gate = _scrollGate;
+    if (gate != null) {
+      await gate.future.timeout(
+        _scrollWaitCeiling,
+        onTimeout: () {
+          // Treat a gate that outlived the ceiling as stale (a missed "scroll
+          // ended"): drop it so the queue keeps moving.
+          if (identical(_scrollGate, gate)) _scrollGate = null;
+        },
+      );
+    }
+    // Always leave at least one frame between two generations.
+    await Future<void>.delayed(_jobGap);
   }
 
   /// Builds the cover from an archive that is already open (import path).
@@ -132,6 +195,11 @@ class ComicCoverService {
 
     return _enqueue<ComicCover?>(() async {
       // Every card that wanted this cover has scrolled away: skip the work.
+      if ((_interest[comic.id] ?? 0) <= 0) return null;
+
+      // Heavy work starts only while the library is idle, and only if somebody
+      // still wants the cover once the wait is over.
+      await _waitForScrollIdle();
       if ((_interest[comic.id] ?? 0) <= 0) return null;
 
       // An import (adopt) may have produced it while we were queued.
@@ -209,7 +277,7 @@ class ComicCoverService {
     return future;
   }
 
-  static String _safe(String id) => id.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+  static String _safe(String id) => id.replaceAll(_unsafeChars, '_');
 
   static String _pngPath(Directory dir, String id) =>
       '${dir.path}${Platform.pathSeparator}${_safe(id)}.png';
@@ -224,10 +292,16 @@ class ComicCoverService {
     try {
       final Directory dir = await _dir();
       final File png = File(_pngPath(dir, id));
-      final File meta = File(_metaPath(dir, id));
-      if (!await meta.exists() || !await png.exists()) return null;
 
-      final Object? parsed = jsonDecode(await meta.readAsString());
+      // One read instead of exists() + read: a missing record (the common case
+      // while a big library is first scrolled) costs a single failed open.
+      final String raw = await File(_metaPath(dir, id)).readAsString().then<String>(
+        (String value) => value,
+        onError: (Object _) => '',
+      );
+      if (raw.isEmpty || !await png.exists()) return null;
+
+      final Object? parsed = jsonDecode(raw);
       if (parsed is! Map) return null;
       final Object? version = parsed['v'];
       final Object? pages = parsed['pages'];
@@ -282,15 +356,52 @@ class ComicCoverService {
     return cover;
   }
 
-  /// Decodes at thumbnail size (the codec downsamples while decoding, so the
-  /// full-resolution page never sits in memory as a bitmap) and re-encodes as
-  /// PNG. Both steps run on engine worker threads, not the UI isolate.
-  static Future<Uint8List> _downscaleToPng(Uint8List bytes) async {
-    final ui.Codec codec = await ui.instantiateImageCodec(
-      bytes,
-      targetWidth: _coverWidth,
-      allowUpscaling: false,
+  /// Fits [width] x [height] inside the cover budget: at most [_coverWidth]
+  /// wide AND at most [_coverMaxPixels] in area, never upscaled.
+  static _CoverSize _fitCover(int width, int height) {
+    if (width <= 0 || height <= 0) return const _CoverSize(_coverWidth, _coverWidth);
+    final double byWidth = _coverWidth / width;
+    final double byArea = math.sqrt(_coverMaxPixels / (width * height.toDouble()));
+    final double scale = math.min(1.0, math.min(byWidth, byArea));
+    return _CoverSize(
+      math.max(1, (width * scale).round()),
+      math.max(1, (height * scale).round()),
     );
+  }
+
+  /// Reads only the header to learn the page size, then opens a codec that
+  /// decodes straight to the bounded thumbnail size. For JPEG/WebP the engine
+  /// can scale inside the decoder, so the full-resolution bitmap is never
+  /// materialised; for PNG pages the decoder still needs the full bitmap
+  /// transiently, which is why the stored result is also area-bounded.
+  static Future<ui.Codec> _openThumbnailCodec(Uint8List bytes) async {
+    final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
+      bytes,
+    );
+    try {
+      final ui.ImageDescriptor descriptor = await ui.ImageDescriptor.encoded(
+        buffer,
+      );
+      try {
+        final _CoverSize target = _fitCover(descriptor.width, descriptor.height);
+        // The codec keeps its own reference to the descriptor.
+        return await descriptor.instantiateCodec(
+          targetWidth: target.width,
+          targetHeight: target.height,
+        );
+      } catch (_) {
+        descriptor.dispose();
+        rethrow;
+      }
+    } finally {
+      buffer.dispose();
+    }
+  }
+
+  /// Decodes at the bounded thumbnail size and re-encodes as PNG. Both steps
+  /// run on engine worker threads, not the UI isolate.
+  static Future<Uint8List> _downscaleToPng(Uint8List bytes) async {
+    final ui.Codec codec = await _openThumbnailCodec(bytes);
     try {
       final ui.FrameInfo frame = await codec.getNextFrame();
       final ui.Image image = frame.image;
@@ -315,4 +426,12 @@ class ComicCoverService {
       debugPrint('ComicCoverService: could not delete ${file.path}: $e');
     }
   }
+}
+
+/// Pixel size of a bounded cover thumbnail.
+class _CoverSize {
+  const _CoverSize(this.width, this.height);
+
+  final int width;
+  final int height;
 }
