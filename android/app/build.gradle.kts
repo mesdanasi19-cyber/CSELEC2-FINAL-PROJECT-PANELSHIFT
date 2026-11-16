@@ -30,7 +30,7 @@ android {
         versionName = flutter.versionName
 
         ndk {
-            abiFilters.add("armeabi-v7a")
+            abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a"))
         }
 
         externalNativeBuild {
