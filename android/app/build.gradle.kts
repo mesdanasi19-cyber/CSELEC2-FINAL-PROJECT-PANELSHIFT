@@ -43,6 +43,9 @@ android {
                 )
             }
         }
+        ndk {
+            abiFilters.addAll(setOf("arm64-v8a"))
+        }
     }
 
     externalNativeBuild {
