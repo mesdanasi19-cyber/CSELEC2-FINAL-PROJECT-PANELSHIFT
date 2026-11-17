@@ -44,8 +44,9 @@
 
 // Pipeline (everything runs on the page stretched to 640x640; boxes are 0..1):
 //   resize -> pack CHW blob -> forward -> raw detections (> kConfThreshold)
-//   -> nms -> filter_geometry -> merge_fragments -> flat-region check
-//   -> residue guard -> sort_reading_order
+//   -> nms (keeps the best Params::max_candidates = 300 by score) -> filter_geometry
+//   -> drop_union_boxes -> merge_fragments -> flat-region check -> residue guard
+//   -> sort_reading_order
 
 namespace {
 
@@ -82,12 +83,23 @@ constexpr double kMinStdDev = 15.0;
 // 0.0f to disable.
 constexpr float kMinPageCoverage = 0.15f;
 
-// Hard cap on detections handed to NMS (highest confidence win). A normal page
-// yields a few dozen, so this never triggers there and its candidate list is
-// untouched. It only matters when the model fires on thousands of anchors (a blank
-// or very noisy page): the stages after it are quadratic in the worst case, and
-// this keeps their cost bounded whatever the model emits.
-constexpr int kMaxCandidates = 1000;
+// ---- Post-processing switches -------------------------------------------------
+// Two changes to panel_postprocess.h, each undone by one line so they can be compared
+// with the previous behaviour on your own pages (PANELSHIFT_PROFILE shows what each
+// one does). Both are tested on synthetic pages only, not on your detector's output.
+//
+// A weak box that spans two neighbouring panels would absorb both in merge_fragments
+// and swallow the gutter between them (nothing else can: merge_fragments never
+// bridges a gap). true drops such a box; false leaves it in.
+constexpr bool kDropUnionBoxes = true;
+
+// Reading order. false = row grouping only, exactly the previous behaviour. true =
+// also split at a clear gap when a box spans several rows (a tall panel beside a
+// stack), which row grouping gets right or wrong depending on a fraction of a percent
+// of vertical offset. The price: on a plain grid that a stray box has distorted into a
+// box spanning rows, the cut can read a block column by column (about 1% of such pages
+// under harsh synthetic noise, 0.2% or less under typical noise).
+constexpr bool kCutReadingOrder = true;
 
 // ---- Limits & platform --------------------------------------------------------
 
@@ -108,13 +120,6 @@ constexpr bool kSwapRB = false;
 // kDnnThreads big cores the extra threads simply share them. Measure with
 // PANELSHIFT_PROFILE before changing (try 2 and 4). 0 = leave OpenCV's default.
 constexpr int kDnnThreads = 4;
-
-// A detection as it came out of the model (normalised and clamped). A plain
-// struct of our own, so the candidate cap below does not depend on how
-// panelshift::Box names its confidence member.
-struct RawDetection {
-    float x0, y0, x1, y1, conf;
-};
 
 // ---- Shared state & thread-safety audit ---------------------------------------
 // Every object below is read and written ONLY while g_mutex is held:
@@ -142,14 +147,13 @@ std::unique_ptr<cv::dnn::Net> g_net;   // guarded by g_mutex
 // twice the blob's size; measured with OpenCV 5.0 on desktop), i.e. ~4.9 MB
 // allocated and freed on every page. Peak during pre-processing falls from
 // ~13.1 MB to ~7.0 MB, with no per-page allocation left for the big buffers.
-// What still allocates per page are a few small std::vectors (a few KB each)
-// here and inside panel_postprocess; not worth pooling, and nms() takes its
-// input by value, so a "pooled" candidate vector lost its buffer on every call
-// anyway.
+// What still allocates per page are a few small std::vectors (a few KB each) here
+// and inside panel_postprocess. They are deliberately not pooled: nms() takes its
+// input by value and every stage returns a new vector, so a "pooled" candidate
+// vector lost its buffer on every call anyway.
 cv::Mat g_blob;
 cv::Mat g_small_rgba;
 cv::Mat g_gray;
-std::vector<RawDetection> g_raw;  // capacity kept between calls
 
 inline float clamp01(float v) { return std::max(0.0f, std::min(1.0f, v)); }
 inline int clampi(int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); }
@@ -234,7 +238,6 @@ int initYoloModel(const char* model_path_cstr) {
         // allocation cost either.
         g_small_rgba.create(kInputSize, kInputSize, CV_8UC4);
         g_gray.create(kInputSize, kInputSize, CV_8UC1);
-        g_raw.reserve(256);
 
         g_small_rgba.setTo(cv::Scalar(255, 255, 255, 255));
         pack_input_blob(g_small_rgba, g_blob);
@@ -344,7 +347,8 @@ int process_comic_panels(
             return data[static_cast<size_t>(r) * stride_r + static_cast<size_t>(c) * stride_c];
         };
 
-        g_raw.clear();  // keeps capacity: no reallocation after warm-up
+        std::vector<panelshift::Box> candidates;
+        candidates.reserve(128);  // a normal page has a few dozen; it grows if a noisy one has more
         const float inv_input = 1.0f / static_cast<float>(kInputSize);
         for (int i = 0; i < cols; ++i) {
             float confidence = at(4, i);
@@ -362,34 +366,28 @@ int process_comic_panels(
             const float x1 = clamp01((cx + 0.5f * w) * inv_input);
             const float y1 = clamp01((cy + 0.5f * h) * inv_input);
             // Clamping can collapse a box that lies outside the page to zero area.
-            // Such a box can never be a panel and would only feed 0/0 into IoU.
+            // Such a box can never be a panel and would only take one of the 300
+            // candidate slots nms() keeps.
             if (!(x1 > x0) || !(y1 > y0)) continue;
-            g_raw.push_back(RawDetection{x0, y0, x1, y1, confidence});
+            candidates.push_back(panelshift::Box{x0, y0, x1 - x0, y1 - y0, confidence});
         }
-
-        // Bound the worst case of the stages below (see kMaxCandidates). A no-op on
-        // normal pages, so their candidate list is exactly what it was before.
-        if (g_raw.size() > static_cast<size_t>(kMaxCandidates)) {
-            std::nth_element(g_raw.begin(), g_raw.begin() + kMaxCandidates, g_raw.end(),
-                             [](const RawDetection& a, const RawDetection& b) { return a.conf > b.conf; });
-            g_raw.erase(g_raw.begin() + kMaxCandidates, g_raw.end());
-        }
-        PS_COUNT(n_raw, g_raw.size());
-
-        std::vector<panelshift::Box> candidates;
-        candidates.reserve(g_raw.size());  // one exact-size allocation, a few KB
-        for (const RawDetection& d : g_raw) {
-            candidates.push_back(panelshift::Box{d.x0, d.y0, d.x1 - d.x0, d.y1 - d.y0, d.conf});
-        }
+        PS_COUNT(n_raw, candidates.size());
 
         // --- Post-processing (see panel_postprocess.h) --------------------------
         panelshift::Params params;
         params.page_aspect = static_cast<float>(width) / static_cast<float>(height);
+        params.use_cuts = kCutReadingOrder;
 
         std::vector<panelshift::Box> boxes = panelshift::nms(std::move(candidates), params);
         PS_COUNT(n_nms, boxes.size());
         boxes = panelshift::filter_geometry(boxes, params);
         PS_COUNT(n_geometry, boxes.size());
+        // merge_fragments never bridges a gap, but it does absorb everything inside a
+        // box, so a weak box spanning two neighbouring panels would fuse them and
+        // swallow the gutter between them (see drop_union_boxes and kDropUnionBoxes).
+        // Run unconditionally: only the logging below depends on the profile flag.
+        const size_t union_dropped = kDropUnionBoxes ? panelshift::drop_union_boxes(boxes, params) : 0;
+        (void)union_dropped;
         boxes = panelshift::merge_fragments(std::move(boxes), params);
         PS_COUNT(n_merged, boxes.size());
 
@@ -453,8 +451,16 @@ int process_comic_panels(
         PS_TICK(t3);
         LOGI("panels=%d  input=%dx%d  pre=%.1fms  forward=%.1fms  post=%.1fms",
              panel_count, width, height, PS_MS(t0, t1), PS_MS(t1, t2), PS_MS(t2, t3));
-        LOGI("stages raw=%zu nms=%zu geometry=%zu merged=%zu textured=%zu final=%d",
-             n_raw, n_nms, n_geometry, n_merged, n_textured, panel_count);
+        LOGI("stages raw=%zu nms=%zu geometry=%zu union_dropped=%zu merged=%zu textured=%zu final=%d",
+             n_raw, n_nms, n_geometry, union_dropped, n_merged, n_textured, panel_count);
+        // Area and score of every box that is returned: the signature of whatever
+        // artifacts survive (small and weak = a bubble or caption) shows up here.
+        for (int i = 0; i < panel_count; ++i) {
+            const panelshift::Box& b = boxes[i];
+            LOGI("  panel %d: x=%.3f y=%.3f w=%.3f h=%.3f area=%.3f score=%.2f", i,
+                 static_cast<double>(b.x), static_cast<double>(b.y), static_cast<double>(b.w),
+                 static_cast<double>(b.h), static_cast<double>(b.w * b.h), static_cast<double>(b.score));
+        }
 #else
         LOGI("YOLO extracted %d comic panels.", panel_count);
 #endif
