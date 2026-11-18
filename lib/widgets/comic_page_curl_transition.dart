@@ -129,6 +129,14 @@ const double _kDefaultTouchY = 0.85; // lower fold origin for taps / no finger (
 const double _kDefaultRadiusFraction = 0.075; // roll radius vs. short side
 const double _kDefaultGhostOpacity = 0.35; // inverted ghost on the back
 const double _kDefaultGhostPaperOpacity = 1; // paper tint under the ghost
+// Reverse (manga) support is done by mirroring the whole curl layer
+// horizontally. The inner PageView stays a normal LTR PageView, so a finger
+// moving left->right on screen is a "forward" drag in the mirrored space, and
+// the sheet hinges on the RIGHT edge and peels from the LEFT edge. Every page is
+// mirrored a second time so it reads normally. All fold/geometry maths stays
+// untouched because it runs in the (mirrored) internal space.
+final Matrix4 _kMirrorX = Matrix4.diagonal3Values(-1.0, 1.0, 1.0);
+final Matrix4 _kNoMirror = Matrix4.identity();
 // Keep the curl alive almost to the settled PageView position. The direction
 // anchor uses the same narrow threshold so it cannot flip while curling.
 const double _kEdgeEps = 1e-4;
@@ -264,6 +272,7 @@ class ComicCurlPageView extends StatefulWidget {
     this.ghostPaperOpacity = _kDefaultGhostPaperOpacity,
     this.radiusFraction = _kDefaultRadiusFraction,
     this.enabled = true,
+    this.reverse = false,
   });
 
   final PageController controller;
@@ -322,6 +331,12 @@ class ComicCurlPageView extends StatefulWidget {
 
   /// When false pages simply scroll (the curl layer becomes a pass-through).
   final bool enabled;
+
+  /// Same meaning as [PageView.reverse]. Item 0 sits on the right, a
+  /// left->right swipe advances, and the curl peels from the LEFT edge. The
+  /// builders ([itemBuilder], [paperRectBuilder], [leavesBuilder]) keep working
+  /// in plain screen coordinates; the mirroring is handled internally.
+  final bool reverse;
 
   @override
   State<ComicCurlPageView> createState() => _ComicCurlPageViewState();
@@ -431,6 +446,17 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView>
     if (oldWidget.itemCount != widget.itemCount ||
         (oldWidget.enabled && !widget.enabled)) {
       _turnStartNotified = false;    
+      _clearSnapshots();
+      if (widget.enabled && widget.itemCount > 0) {
+        _scheduleSnapshot(_readPage(widget.controller).round());
+      }
+    }
+
+    // Snapshots are captured from the (possibly mirrored) item subtree. A
+    // direction change makes every stored texture the wrong way round.
+    if (oldWidget.reverse != widget.reverse) {
+      _turnStartNotified = false;
+      _backFaceWidgets.clear();
       _clearSnapshots();
       if (widget.enabled && widget.itemCount > 0) {
         _scheduleSnapshot(_readPage(widget.controller).round());
@@ -955,22 +981,45 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView>
 
   bool _isBlocked() => widget.isInteractionBlocked?.call() ?? false;
 
-  Rect? _paperRect(int index, Size viewport) =>
-      widget.paperRectBuilder?.call(index, viewport);
+  // Wraps content in the (optional) horizontal mirror. The Transform is always
+  // present (identity when !reverse) so toggling reverse never changes the
+  // element tree; a translation-only RenderTransform adds no layer.
+  Widget _orient(Widget child) => Transform(
+    alignment: Alignment.center,
+    transform: widget.reverse ? _kMirrorX : _kNoMirror,
+    child: child,
+  );
 
-  ComicCurlLeaves? _leaves(int index, Size viewport) =>
-      widget.leavesBuilder?.call(index, viewport);
+  Rect _mirrorRect(Rect r, double width) =>
+      Rect.fromLTRB(width - r.right, r.top, width - r.left, r.bottom);
 
+  // The host reports rects in screen space; the curl runs in mirrored space.
+  Rect? _paperRect(int index, Size viewport) {
+    final Rect? rect = widget.paperRectBuilder?.call(index, viewport);
+    if (rect == null || !widget.reverse) return rect;
+    return _mirrorRect(rect, viewport.width);
+  }
+
+  // Screen-left leaf becomes the internal RIGHT leaf (the one that peels on a
+  // forward turn); screen-right leaf becomes the internal LEFT leaf.
+  ComicCurlLeaves? _leaves(int index, Size viewport) {
+    final ComicCurlLeaves? leaves = widget.leavesBuilder?.call(index, viewport);
+    if (leaves == null || !widget.reverse) return leaves;
+    return ComicCurlLeaves(
+      left: _mirrorRect(leaves.right, viewport.width),
+      right: _mirrorRect(leaves.left, viewport.width),
+    );
+  }
+
+  // Item content is mirrored a second time so it reads normally on screen.
   Widget _buildItem(BuildContext context, int index) =>
-      widget.itemBuilder(context, index);
+      _orient(widget.itemBuilder(context, index));
 
   Widget _buildBackFaceItem(BuildContext context, int index) =>
-      _backFaceWidgets.putIfAbsent(
-        index,
-        () =>
-            widget.backFaceBuilder?.call(context, index) ??
-            _buildItem(context, index),
-      );
+      _backFaceWidgets.putIfAbsent(index, () {
+        final Widget? custom = widget.backFaceBuilder?.call(context, index);
+        return custom != null ? _orient(custom) : _buildItem(context, index);
+      });
 
   bool _isPagerActivelyScrolling() {
     if (!widget.controller.hasClients ||
@@ -1042,7 +1091,12 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView>
         builder: (BuildContext context, BoxConstraints constraints) {
           final Size touchSize = constraints.biggest;
           _noteViewportSize(touchSize);
-          return Listener(
+          // Mirror the pointer layer + pager. Transform hit-tests in the
+          // mirrored space, so drags and the Listener's localPosition agree
+          // with the geometry, and a physical left->right drag is a forward
+          // drag when [reverse] is set.
+          return _orient(
+            Listener(
             behavior: HitTestBehavior.translucent,
             onPointerDown: (PointerEvent event) =>
                 _handlePointer(event, touchSize),
@@ -1071,10 +1125,11 @@ class _ComicCurlPageViewState extends State<ComicCurlPageView>
                   index: index,
                   child: RepaintBoundary(
                     key: snapshotKey,
-                    child: widget.itemBuilder(context, index),
+                    child: _buildItem(context, index),
                   ),
                 );
               },
+            ),
             ),
           );
         },

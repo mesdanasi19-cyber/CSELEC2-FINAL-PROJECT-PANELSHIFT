@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/physics.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -112,10 +113,21 @@ class _DeferredZoom {
 
 // Google Books style pairing. Depends only on which pages are "wide", so it can
 // run anywhere, including a background isolate.
-List<List<int?>> _computeDoubleLayout(List<bool> wide) {
+//
+// [manga] mirrors the pairing so the earlier page is on the RIGHT
+// (index 0 = left half, index 1 = right half):
+//   LTR  cover/end page: [null, i]   pair: [i, i + 1]
+//   RTL  cover/end page: [i, null]   pair: [i + 1, i]
+// The grouping is identical in both modes, so the spread COUNT and the virtual
+// index of every physical page never change when the direction flips.
+List<List<int?>> _computeDoubleLayout(List<bool> wide, {bool manga = false}) {
   final int count = wide.length;
   final List<List<int?>> layout = <List<int?>>[];
   int i = 0;
+
+  // A single (non-wide) page next to a blank half.
+  List<int?> alone(int page) =>
+      manga ? <int?>[page, null] : <int?>[null, page];
 
   while (i < count) {
     final bool isWide = wide[i];
@@ -125,20 +137,20 @@ List<List<int?>> _computeDoubleLayout(List<bool> wide) {
       if (isWide) {
         layout.add(<int?>[i]);
       } else {
-        layout.add(<int?>[null, i]);
+        layout.add(alone(i));
       }
       i++;
     } else {
       if (i + 1 < count) {
         if (wide[i + 1]) {
-          layout.add(<int?>[null, i]);
+          layout.add(alone(i));
           i++;
         } else {
-          layout.add(<int?>[i, i + 1]);
+          layout.add(manga ? <int?>[i + 1, i] : <int?>[i, i + 1]);
           i += 2;
         }
       } else {
-        layout.add(<int?>[null, i]);
+        layout.add(alone(i));
         i++;
       }
     }
@@ -149,13 +161,17 @@ List<List<int?>> _computeDoubleLayout(List<bool> wide) {
 // Short books are laid out inline (a few microseconds). Long ones are computed
 // on a background isolate so the UI thread never stalls. The result crosses the
 // isolate boundary as a flat int list ([first, second] per spread; -1 = blank
-// left half, -2 = single-page spread) so its element types are always exact.
-Future<List<List<int?>>> _computeDoubleLayoutOffThread(List<bool> wide) async {
-  if (wide.length < 200) return _computeDoubleLayout(wide);
+// half in EITHER slot, -2 in the second slot = single-page spread) so its
+// element types are always exact.
+Future<List<List<int?>>> _computeDoubleLayoutOffThread(
+  List<bool> wide, {
+  bool manga = false,
+}) async {
+  if (wide.length < 200) return _computeDoubleLayout(wide, manga: manga);
   try {
     final List<int> flat = await Isolate.run<List<int>>(() {
       final List<int> out = <int>[];
-      for (final List<int?> spread in _computeDoubleLayout(wide)) {
+      for (final List<int?> spread in _computeDoubleLayout(wide, manga: manga)) {
         if (spread.length == 1) {
           out
             ..add(spread[0]!)
@@ -163,7 +179,7 @@ Future<List<List<int?>>> _computeDoubleLayoutOffThread(List<bool> wide) async {
         } else {
           out
             ..add(spread[0] ?? -1)
-            ..add(spread[1]!);
+            ..add(spread[1] ?? -1);
         }
       }
       return out;
@@ -172,13 +188,164 @@ Future<List<List<int?>>> _computeDoubleLayoutOffThread(List<bool> wide) async {
     for (int k = 0; k + 1 < flat.length; k += 2) {
       final int a = flat[k];
       final int b = flat[k + 1];
-      layout.add(b == -2 ? <int?>[a] : <int?>[a == -1 ? null : a, b]);
+      layout.add(
+        b == -2
+            ? <int?>[a]
+            : <int?>[a == -1 ? null : a, b == -1 ? null : b],
+      );
     }
     return layout;
   } catch (e) {
     debugPrint('Background layout failed, computing inline: $e');
-    return _computeDoubleLayout(wide);
+    return _computeDoubleLayout(wide, manga: manga);
   }
+}
+//v3.0.0
+// Pure helper (no widget state, never mutates its input): orders panels the way
+// manga is read. X is mirrored (1 - (x + width)) before sorting, so ascending
+// mirrored-x == right-to-left. Rows run top-to-bottom; a panel joins the
+// current row when it overlaps at least 50% of the smaller of the two heights.
+
+//v.3.0.2
+// Mirrors x (1 - (x + width)) and applies the same hybrid row-grouping +
+// recursive XY-cut logic as panel_postprocess.h so vertical panel stacks beside
+// tall panels are always read top-to-bottom before crossing a vertical gutter.
+List<ComicPanel> _orderPanelsRightToLeft(List<ComicPanel> panels) {
+  if (panels.length < 2) return panels;
+
+  double mirroredX(ComicPanel p) => 1.0 - (p.x + p.width);
+  double mirroredRight(ComicPanel p) => 1.0 - p.x;
+
+  bool sharesRow(ComicPanel a, ComicPanel b) {
+    final double minH = math.min(a.height, b.height);
+    final double overlap =
+        math.min(a.y + a.height, b.y + b.height) - math.max(a.y, b.y);
+    return minH > 0.0 && overlap > 0.50 * minH;
+  }
+
+  List<List<ComicPanel>> groupRows(List<ComicPanel> items) {
+    final List<ComicPanel> sorted = List<ComicPanel>.of(items)
+      ..sort((ComicPanel a, ComicPanel b) => a.y.compareTo(b.y));
+    final List<bool> used = List<bool>.filled(sorted.length, false);
+    final List<List<ComicPanel>> rows = <List<ComicPanel>>[];
+
+    for (int i = 0; i < sorted.length; i++) {
+      if (used[i]) continue;
+      final ComicPanel seed = sorted[i];
+      final List<ComicPanel> row = <ComicPanel>[seed];
+      used[i] = true;
+
+      for (int j = i + 1; j < sorted.length; j++) {
+        if (!used[j] && sharesRow(seed, sorted[j])) {
+          row.add(sorted[j]);
+          used[j] = true;
+        }
+      }
+
+      // Insertion sort within row: right-to-left (mirroredX), then top-to-bottom
+      for (int k = 1; k < row.length; k++) {
+        final ComicPanel key = row[k];
+        int m = k;
+        while (m > 0) {
+          final ComicPanel prev = row[m - 1];
+          final double dx = (mirroredX(key) - mirroredX(prev)).abs();
+          final bool before = dx > 0.03
+              ? mirroredX(key) < mirroredX(prev)
+              : key.y < prev.y;
+          if (!before) break;
+          row[m] = prev;
+          m--;
+        }
+        row[m] = key;
+      }
+      rows.add(row);
+    }
+    return rows;
+  }
+
+  bool rowsConsistent(List<List<ComicPanel>> rows) {
+    for (int r = 0; r < rows.length; r++) {
+      for (int i = 0; i < rows[r].length; i++) {
+        for (int j = i + 1; j < rows[r].length; j++) {
+          if (!sharesRow(rows[r][i], rows[r][j])) return false;
+        }
+        for (int s = r + 1; s < rows.length; s++) {
+          for (final ComicPanel other in rows[s]) {
+            if (sharesRow(rows[r][i], other)) return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  bool splitAtGap(
+    List<ComicPanel> items,
+    bool byY,
+    List<ComicPanel> first,
+    List<ComicPanel> second,
+  ) {
+    final List<ComicPanel> sorted = List<ComicPanel>.of(items)
+      ..sort(
+        (ComicPanel a, ComicPanel b) =>
+            byY ? a.y.compareTo(b.y) : mirroredX(a).compareTo(mirroredX(b)),
+      );
+    double reach = byY
+        ? (sorted[0].y + sorted[0].height)
+        : mirroredRight(sorted[0]);
+    for (int k = 1; k < sorted.length; k++) {
+      final double start = byY ? sorted[k].y : mirroredX(sorted[k]);
+      if (start >= reach - 0.02) {
+        first.addAll(sorted.sublist(0, k));
+        second.addAll(sorted.sublist(k));
+        return true;
+      }
+      reach = math.max(
+        reach,
+        byY ? (sorted[k].y + sorted[k].height) : mirroredRight(sorted[k]),
+      );
+    }
+    return false;
+  }
+
+  void orderRegion(List<ComicPanel> items, List<ComicPanel> out) {
+    if (items.length < 2) {
+      out.addAll(items);
+      return;
+    }
+    final List<List<ComicPanel>> rows = groupRows(items);
+    if (rowsConsistent(rows)) {
+      for (final List<ComicPanel> row in rows) {
+        out.addAll(row);
+      }
+      return;
+    }
+    final List<ComicPanel> first = <ComicPanel>[];
+    final List<ComicPanel> second = <ComicPanel>[];
+    if (splitAtGap(items, true, first, second) ||
+        splitAtGap(items, false, first, second)) {
+      orderRegion(first, out);
+      orderRegion(second, out);
+      return;
+    }
+    for (final List<ComicPanel> row in rows) {
+      out.addAll(row);
+    }
+  }
+
+  final List<ComicPanel> ordered = <ComicPanel>[];
+  orderRegion(panels, ordered);
+  return ordered;
+}
+
+// Memo of the right-to-left order of one page, validated by the identity of the
+// cached source list (so a re-detection invalidates it automatically).
+// _detectedPanelsCache itself is never touched.
+class _RtlPanelOrder {
+  const _RtlPanelOrder(this.source, this.ordered);
+
+  final List<ComicPanel> source;
+  final List<ComicPanel> ordered;
 }
 
 class ComicReaderScreen extends StatefulWidget {
@@ -358,6 +525,16 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   bool _showUI = true;
   bool _isDoublePageView = false;
 
+  // Manga / right-to-left reading order. Loaded from SharedPreferences in
+  // _bootstrap (before the first layout build) so it stays the default across
+  // comics and app restarts, and persisted on every toggle.
+  static const String _kMangaModePrefKey = 'reader_manga_mode';
+  bool _isMangaMode = false;
+  // Direction the CURRENT _doubleLayout was built for. _getEffectiveLayout reads
+  // this (not _isMangaMode) so a layout and its compaction can never disagree.
+  bool _doubleLayoutIsManga = false;
+  final Map<int, _RtlPanelOrder> _rtlPanelOrder = <int, _RtlPanelOrder>{};
+
   // Reading transition: the custom page curl or a plain horizontal slide.
   PageTransitionMode _transitionMode = PageTransitionMode.curl;
   bool get _useCurl => _transitionMode == PageTransitionMode.curl;
@@ -413,6 +590,14 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   static const bool _kInstantEdgeTaps = true;
   static const double _kEdgeZoneLeft = 0.3;
   static const double _kEdgeZoneRight = 0.7;
+
+  // Instant 0 ms edge taps apply only while actively zoomed into a panel.
+// In full-page view, edge zones yield to GestureDetector so double-tapping
+// any panel near the left/right edges jumps directly into it.
+  bool get _useInstantEdgeTaps =>
+      _kInstantEdgeTaps &&
+          _fullPagePosition == FullPagePosition.none &&
+          !_transformationController.value.isIdentity();
   // The platform touch slop (8 dp on Android): beyond it the PageView's drag
   // recogniser has taken the gesture, so it must not also count as a tap.
   static const double _kTapMoveSlop = 8.0;
@@ -423,6 +608,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   int? _tapPointer;
   Offset? _tapDownLocal;
   Duration? _tapDownTime;
+  bool _edgeTapHandled = false;
 
   // Refreshes the curl snapshot once a zoom has settled (see _noteZoomSettled).
   Timer? _zoomSnapshotTimer;
@@ -795,8 +981,32 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // spread each side), so a page the PageView is still building never loses its bytes.
   static const int _extraResidentPages = 2;
 
+  // Reads the persisted reading direction. Falls back to left-to-right.
+  Future<void> _loadMangaMode() async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      _isMangaMode = prefs.getBool(_kMangaModePrefKey) ?? false;
+      _doubleLayoutIsManga = _isMangaMode;
+    } catch (e, st) {
+      debugPrint('Manga mode load failed: $e\n$st');
+    }
+  }
+
+  Future<void> _persistMangaMode(bool value) async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kMangaModePrefKey, value);
+    } catch (e, st) {
+      debugPrint('Manga mode save failed: $e\n$st');
+    }
+  }
+
   Future<void> _bootstrap() async {
     try {
+      // The direction must be known before any layout is built or the pager is
+      // shown (_isEngineReady is still false here).
+      await _loadMangaMode();
+
       unawaited(NativeOpenCvService.initializeEngine().catchError((Object e, StackTrace st) {
         debugPrint('YOLO engine init failed: $e\n$st');
       }));
@@ -1126,16 +1336,31 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // are wide, so long books are computed on a background isolate and the UI
   // thread just receives the finished list. Toggling spread view never calls
   // this: it only switches between two layouts that already exist.
-  Future<void> _buildDoubleLayout() async {
-    final List<bool> wide = List<bool>.generate(_pageCount, (int i) {
-      final Size? size = _imageSizesCache[i];
-      return size != null && size.width > size.height * 1.15;
-    }, growable: false);
+  List<bool> _wideFlags() => List<bool>.generate(_pageCount, (int i) {
+    final Size? size = _imageSizesCache[i];
+    return size != null && size.width > size.height * 1.15;
+  }, growable: false);
 
-    final List<List<int?>> layout = await _computeDoubleLayoutOffThread(wide);
-    if (!mounted) return;
-    _doubleLayout = layout;
+  // Builds for the current reading direction. If the user flipped it while the
+  // (possibly isolate-based) computation was running, it is computed again.
+  Future<void> _buildDoubleLayout() async {
+    final List<bool> wide = _wideFlags();
+    bool manga;
+    do {
+      manga = _isMangaMode;
+      final List<List<int?>> layout = await _computeDoubleLayoutOffThread(
+        wide,
+        manga: manga,
+      );
+      if (!mounted) return;
+      _doubleLayout = layout;
+      _doubleLayoutIsManga = manga;
+    } while (manga != _isMangaMode);
   }
+
+  // Used by _toggleMangaMode: computes a layout without assigning anything.
+  Future<List<List<int?>>> _computeDoubleLayoutFor(bool manga) =>
+      _computeDoubleLayoutOffThread(_wideFlags(), manga: manga);
 
   // Active layout (null placeholders removed). The compacted double layout is
   // built once per assignment of _doubleLayout instead of on every call: this
@@ -1152,9 +1377,15 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       if (cached != null && identical(_compactDoubleLayoutSource, source)) {
         return cached;
       }
-      final List<List<int>> compact = source
-          .map((spread) => spread.whereType<int>().toList())
-          .toList();
+      // The effective layout is always in READING order. Manga spreads are
+      // stored [left, right] = [later, earlier], so they are reversed here:
+      // [i + 1, i] -> [i, i + 1] and [i, null] -> [i]. pages.first is always
+      // the first page read (right side), pages.last the second (left side).
+      final bool manga = _doubleLayoutIsManga;
+      final List<List<int>> compact = source.map((spread) {
+        final List<int> pages = spread.whereType<int>().toList();
+        return manga ? pages.reversed.toList() : pages;
+      }).toList();
       _compactDoubleLayoutSource = source;
       _compactDoubleLayout = compact;
       return compact;
@@ -1177,8 +1408,28 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
 
   // Panels of one page for navigation: the detected ones, or the full-page
   // fallback while detection is still running. Never waits.
-  List<ComicPanel> _panelsOf(int page) =>
-      _detectedPanelsCache[page] ?? _fullPageFallback;
+  //
+  // In manga mode the detected panels come back right-to-left (see
+  // _orderPanelsRightToLeft). _detectedPanelsCache is not mutated or
+  // invalidated: the ordered copy is memoised per page against the identity of
+  // the cached list. Every consumer of a panel INDEX must go through this.
+  List<ComicPanel> _panelsOf(int page) {
+    final List<ComicPanel>? detected = _detectedPanelsCache[page];
+    if (detected == null) return _fullPageFallback;
+    if (!_isMangaMode || detected.length < 2) return detected;
+    final _RtlPanelOrder? memo = _rtlPanelOrder[page];
+    if (memo != null && identical(memo.source, detected)) return memo.ordered;
+    final List<ComicPanel> ordered = _orderPanelsRightToLeft(detected);
+    _rtlPanelOrder[page] = _RtlPanelOrder(detected, ordered);
+    return ordered;
+  }
+
+  // For painters: "nothing detected yet" stays an empty list (no fallback box),
+  // otherwise the same order as navigation so outlines/active panel agree.
+  List<ComicPanel> _panelsForPainting(int page) =>
+      _detectedPanelsCache.containsKey(page)
+      ? _panelsOf(page)
+      : const <ComicPanel>[];
 
   // Every panel of a spread, left page first, then right. Cache only: a page
   // still being detected counts as one full-page panel, so stepping through a
@@ -1290,10 +1541,11 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     final Size? sizeA = a != null ? _imageSizesCache[a] : null;
     final Size? sizeB = b != null ? _imageSizesCache[b] : null;
 
-    final double wB = sizeB != null
-        ? ch * (sizeB.width / sizeB.height)
-        : cw / 2;
+    double wB = sizeB != null ? ch * (sizeB.width / sizeB.height) : cw / 2;
     final double wA = sizeA != null ? ch * (sizeA.width / sizeA.height) : wB;
+    // Manga cover/end page [i, null]: the blank RIGHT half takes the page's
+    // width (the LTR [null, i] case already does this via wA = wB).
+    if (b == null && sizeA != null) wB = wA;
 
     double scale = 1.0;
     if ((wA + wB) > cw) {
@@ -1386,11 +1638,13 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // (on the full-page fallback), swap the fallback for the real panel: clamp the
   // index and zoom onto it. Runs entirely on the back of the worker's result;
   // no gesture ever waited for it.
-  void _onPanelsArrived(int page, List<ComicPanel> panels) {
-    if (!mounted || panels.isEmpty) return;
+  void _onPanelsArrived(int page, List<ComicPanel> rawPanels) {
+    if (!mounted || rawPanels.isEmpty) return;
     if (page != _currentPage || _fullPagePosition != FullPagePosition.none) {
       return;
     }
+    // Panel indices follow the reading order (right-to-left in manga mode).
+    final List<ComicPanel> panels = _panelsOf(page);
     // An arrival fix-up for this spread is pending; it positions the reader.
     if (_pendingArrivalSpread != -1 &&
         _findVirtualPageIndex(page) == _pendingArrivalSpread) {
@@ -1596,6 +1850,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       _isDoublePageView,
       _layoutEpoch,
       _transitionMode,
+      _isMangaMode,
     );
     if (signature == _curlSignature) return;
     _curlSignature = signature;
@@ -1656,6 +1911,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       _tapPointer = event.pointer;
       _tapDownLocal = event.localPosition;
       _tapDownTime = event.timeStamp;
+      _edgeTapHandled = false;
     } else {
       _tapPointer = null; // a second finger: pinch or catch, not a tap
     }
@@ -1667,7 +1923,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     _downPointers.remove(event.pointer);
     final Duration? downTime = _tapDownTime;
     final bool isTap =
-        _kInstantEdgeTaps &&
+        _useInstantEdgeTaps &&
         _tapPointer == event.pointer &&
         downTime != null &&
         event.timeStamp - downTime <= _kTapMaxDuration;
@@ -1677,16 +1933,33 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     final double x = event.localPosition.dx;
     final double width = viewportSize.width;
     if (x < width * _kEdgeZoneLeft) {
-      _prevPanel(viewportSize);
+      _edgeTapHandled = true;
+      _stepFromEdgeTap(leftEdge: true, viewportSize: viewportSize);
     } else if (x > width * _kEdgeZoneRight) {
+      _edgeTapHandled = true;
+      _stepFromEdgeTap(leftEdge: false, viewportSize: viewportSize);
+    }
+  }
+
+  // One place decides what an edge tap means.
+  //   LTR:   left edge = back,    right edge = forward
+  //   Manga: left edge = forward, right edge = back
+  void _stepFromEdgeTap({required bool leftEdge, required Size viewportSize}) {
+    final bool forward = _isMangaMode ? leftEdge : !leftEdge;
+    if (forward) {
       _nextPanel(viewportSize);
+    } else {
+      _prevPanel(viewportSize);
     }
   }
 
   void _onReaderPointerCancel(PointerCancelEvent event) {
     _pointerDownAt = null;
     _downPointers.remove(event.pointer);
-    if (_tapPointer == event.pointer) _tapPointer = null;
+    if (_tapPointer == event.pointer) {
+      _tapPointer = null;
+      _edgeTapHandled = false;
+    }
   }
 
   // A zoom (animated panel focus, pinch or pan) has ended. The curl layer no
@@ -2092,7 +2365,9 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       }
 
       if (position == FullPagePosition.none) {
-        final panels = _detectedPanelsCache[newPage];
+        final List<ComicPanel>? panels = _detectedPanelsCache.containsKey(newPage)
+            ? _panelsOf(newPage)
+            : null;
         if (panels != null && newIdx < panels.length) {
           _focusOnPanel(panels[newIdx], _lastViewportSize ?? vp);
         }
@@ -2206,7 +2481,10 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
 
     // Already detected (e.g. prefetched): zoom immediately.
     final Size? vp = _lastViewportSize;
-    final cached = _detectedPanelsCache[pages.first];
+    final List<ComicPanel>? cached =
+        _detectedPanelsCache.containsKey(pages.first)
+        ? _panelsOf(pages.first)
+        : null;
     if (_fullPagePosition == FullPagePosition.none &&
         vp != null &&
         cached != null &&
@@ -2336,6 +2614,139 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     unawaited(_ensureSpreadPanels(layout[v]));
   }
 
+  // Flips the reading direction without moving the reader: _currentPage and
+  // _currentPanelIndex are never written here, so ReadingProgressTracker sees no
+  // change and never records a reset or corrupted position.
+  Future<void> _toggleMangaMode() async {
+    if (_navBusy || _suspendCurlForLayoutSwitch) return;
+
+    final bool next = !_isMangaMode;
+    unawaited(_persistMangaMode(next)); // persisted immediately
+
+    // Layout still being measured: just flip the flag. _buildDoubleLayout
+    // notices and builds for the new direction.
+    if (!_layoutReady) {
+      setState(() => _isMangaMode = next);
+      return;
+    }
+
+    _pendingArrivalSpread = -1;
+    final int keepPage = _currentPage;
+    final int keepPanel = _currentPanelIndex;
+    final int lock = _lockNav();
+    try {
+      // Same protocol as _toggleSpreadView: zoom to identity, drop parked work,
+      // freeze curl + scrolling, invalidate async continuations of the old
+      // layout.
+      _resetZoomInstant(force: true);
+      _deferredZoom = null;
+      _zoomResetPending = false;
+      setState(() {
+        _suspendCurlForLayoutSwitch = true;
+        _layoutEpoch++;
+        _curlZoomedVirtual = null;
+        _zoomOwnerVirtual = null;
+      });
+
+      // Compute first (isolate for long books), then swap flag + layout in ONE
+      // setState so no frame ever sees a half-switched state.
+      final List<List<int?>> newDouble = await _computeDoubleLayoutFor(next);
+      if (!mounted) return;
+      setState(() {
+        _isMangaMode = next;
+        _doubleLayout = newDouble;
+        _doubleLayoutIsManga = next;
+      });
+
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+
+      // Keep the pager on the same physical page. The curl is suspended, so
+      // onPageChanged is ignored while jumping.
+      final List<List<int>> newLayout = _getEffectiveLayout();
+      if (newLayout.isNotEmpty) {
+        final int targetVirtual = _findVirtualPageIndex(keepPage)
+            .clamp(0, newLayout.length - 1)
+            .toInt();
+        bool positioned = false;
+
+        for (int attempt = 0; attempt < 3 && mounted; attempt++) {
+          if (!_pageController.hasClients) {
+            await WidgetsBinding.instance.endOfFrame;
+            continue;
+          }
+
+          final ScrollPosition position = _pageController.position;
+          if (!position.hasViewportDimension || !position.hasContentDimensions) {
+            await WidgetsBinding.instance.endOfFrame;
+            continue;
+          }
+
+          _pageController.jumpToPage(targetVirtual);
+          await WidgetsBinding.instance.endOfFrame;
+          if (!mounted || !_pageController.hasClients) break;
+
+          final double? actualPage = _safePagerPage();
+          if (actualPage != null &&
+              (actualPage - targetVirtual).abs() < 0.001) {
+            positioned = true;
+            break;
+          }
+        }
+
+        if (!positioned && _pageController.hasClients) {
+          _pageController.jumpToPage(targetVirtual);
+          await WidgetsBinding.instance.endOfFrame;
+        }
+      }
+
+      // Belt and braces: restore progress only if something moved it.
+      if (mounted &&
+          (_currentPage != keepPage || _currentPanelIndex != keepPanel)) {
+        setState(() {
+          _currentPage = keepPage;
+          _currentPanelIndex = keepPanel;
+        });
+      }
+    } catch (e, st) {
+      debugPrint('Manga mode toggle failed: $e\n$st');
+    } finally {
+      if (mounted && _suspendCurlForLayoutSwitch) {
+        // The curl widget re-anchors and drops old-direction textures on this
+        // false -> true transition.
+        setState(() => _suspendCurlForLayoutSwitch = false);
+      }
+      _unlockNav(lock);
+    }
+    if (!mounted) return;
+
+    _onPagerSettled();
+
+    // Snapshots were taken in the old direction: refresh the curl texture.
+    _curlSnapshotDirty = true;
+    if (_transformationController.value.isIdentity()) {
+      _curlSnapshotTick.value++;
+    }
+
+    final List<List<int>> layout = _getEffectiveLayout();
+    if (layout.isEmpty) return;
+    final int v = _findVirtualPageIndex(_currentPage)
+        .clamp(0, layout.length - 1)
+        .toInt();
+    _schedulePrefetch(v);
+    unawaited(_ensureSpreadPanels(layout[v]));
+
+    // The zoom was reset for the switch: put the camera back on the current
+    // panel (looked up in the new order). Full-page views stay at identity.
+    final Size? viewport = _lastViewportSize;
+    if (viewport != null && _fullPagePosition == FullPagePosition.none) {
+      final List<ComicPanel> panels = _panelsOf(_currentPage);
+      if (_currentPanelIndex < panels.length) {
+        _focusOnPanel(panels[_currentPanelIndex], viewport);
+      }
+    }
+  }
+
   // Switches between the page curl and the plain horizontal swipe. The two
   // pagers are different widgets and a ScrollController must never be attached
   // to two scroll views at once, so each switch gives the new pager a fresh
@@ -2390,20 +2801,24 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   // 3-zone tap handler (left 30%: prev, right 30%: next, center: toggle UI)
   void _handleScreenTap(TapUpDetails details, Size viewportSize) {
     if (_suspendCurlForLayoutSwitch) return;
+    if (_edgeTapHandled) {
+      _edgeTapHandled = false;
+      return;
+    }
     final double screenWidth = viewportSize.width;
     final double tapX = details.localPosition.dx;
 
     // Edge zones are handled on finger-up (see _onReaderPointerUp).
-    if (_kInstantEdgeTaps &&
+    if (_useInstantEdgeTaps &&
         (tapX < screenWidth * _kEdgeZoneLeft ||
             tapX > screenWidth * _kEdgeZoneRight)) {
       return;
     }
 
-    if (tapX < screenWidth * 0.3) {
-      _prevPanel(viewportSize);
-    } else if (tapX > screenWidth * 0.7) {
-      _nextPanel(viewportSize);
+    if (tapX < screenWidth * _kEdgeZoneLeft) {
+      _stepFromEdgeTap(leftEdge: true, viewportSize: viewportSize);
+    } else if (tapX > screenWidth * _kEdgeZoneRight) {
+      _stepFromEdgeTap(leftEdge: false, viewportSize: viewportSize);
     } else {
       setState(() {
         _showUI = !_showUI;
@@ -2426,11 +2841,15 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
 
     // Taps in the edge zones are navigation taps (see _onReaderPointerUp); a
     // quick second tap there steps on again instead of zooming.
-    if (_kInstantEdgeTaps &&
+    if (_useInstantEdgeTaps &&
         (localPos.dx < viewportSize.width * _kEdgeZoneLeft ||
             localPos.dx > viewportSize.width * _kEdgeZoneRight)) {
       return;
     }
+
+    // Consume Tap 2's pointer so its upcoming PointerUpEvent does not fire
+    // _onReaderPointerUp after _showPanel switches out of full-page mode.
+    _tapPointer = null;
 
     if (_fullPagePosition == FullPagePosition.none &&
         _transformationController.value != Matrix4.identity()) {
@@ -2450,7 +2869,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       final double nx = (localPos.dx - rect.left) / rect.width;
       final double ny = (localPos.dy - rect.top) / rect.height;
 
-      final panels = _detectedPanelsCache[page] ?? const <ComicPanel>[];
+      final List<ComicPanel> panels = _panelsForPainting(page);
       for (int i = 0; i < panels.length; i++) {
         final p = panels[i];
         if (nx >= p.x &&
@@ -2560,7 +2979,22 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
 
     final int? a = spread[0];
     final int? b = spread[1];
-    if (b == null) return null;
+    // Manga cover/end page [i, null]: real page on the left, blank placeholder
+    // leaf of equal size on the right.
+    if (b == null) {
+      if (a == null) return null;
+      final Rect? pageLeft = _pageRect(virtualIndex, a, vp);
+      if (pageLeft == null || pageLeft.isEmpty) return null;
+      return ComicCurlLeaves(
+        left: pageLeft,
+        right: Rect.fromLTRB(
+          pageLeft.right,
+          pageLeft.top,
+          pageLeft.right + pageLeft.width,
+          pageLeft.bottom,
+        ),
+      );
+    }
 
     final Rect? right = _pageRect(virtualIndex, b, vp);
     if (right == null || right.isEmpty) return null;
@@ -2658,8 +3092,10 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     try {
       if (saved != null && _pageCount > 0) {
         final int page = _currentPage;
-        final List<ComicPanel> panels = await _ensurePanels(page);
+        await _ensurePanels(page);
         if (!mounted) return;
+        // Saved panel indices refer to the current reading order.
+        final List<ComicPanel> panels = _panelsOf(page);
 
         // Panel count may differ from when the position was saved
         if (panels.isNotEmpty && _currentPanelIndex >= panels.length) {
@@ -2741,6 +3177,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
                         child: _useCurl
                             ? ComicCurlPageView.builder(
                                 controller: _pageController,
+                                reverse: _isMangaMode,
                                 snapshotController: _curlSnapshot,
                                 snapshotInvalidator: _curlSnapshotTick,
                                 enabled: !_suspendCurlForLayoutSwitch,
@@ -2783,6 +3220,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
                             // physics, same page content and zoom ownership.
                             : PageView.builder(
                                 controller: _pageController,
+                                reverse: _isMangaMode,
                                 physics: _pagerPhysics,
                                 itemCount: effectiveLayout.length,
                                 onPageChanged: _onPagerPageChanged,
@@ -3181,6 +3619,19 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
             onPressed: _showTurnSpeedDialog,
           ),
         ),
+        Expanded(
+          child: _HubButton(
+            icon: _isMangaMode
+                ? Icons.format_textdirection_r_to_l
+                : Icons.format_textdirection_l_to_r,
+            label: 'Manga',
+            tooltip: _isMangaMode
+                ? 'Manga order: right-to-left (tap for left-to-right)'
+                : 'Left-to-right (tap for manga right-to-left)',
+            active: _isMangaMode,
+            onPressed: () => unawaited(_toggleMangaMode()),
+          ),
+        ),
       ],
     );
   }
@@ -3234,7 +3685,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     int pageIndex, {
     bool forCurlBackFace = false,
   }) {
-    final panels = _detectedPanelsCache[pageIndex] ?? [];
+    final List<ComicPanel> panels = _panelsForPainting(pageIndex);
     final imgSize = _imageSizesCache[pageIndex];
     final Uint8List? bytes = _pageBytes[pageIndex];
     // Outside the resident window (or still being read): nothing to draw yet.
@@ -3306,12 +3757,15 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
         final double maxHeight = constraints.maxHeight;
         final double maxWidth = constraints.maxWidth;
 
-        final double wB = sizeB != null
+        double wB = sizeB != null
             ? maxHeight * (sizeB.width / sizeB.height)
             : maxWidth / 2;
         final double wA = sizeA != null
             ? maxHeight * (sizeA.width / sizeA.height)
             : wB;
+        // Manga cover/end page [i, null]: the blank RIGHT half takes the
+        // page's width.
+        if (pageB == null && sizeA != null) wB = wA;
 
         double scale = 1.0;
         if ((wA + wB) > maxWidth) {
@@ -3346,7 +3800,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
 
   // One half (page) of a double spread
   Widget _buildSpreadHalf(int page, {bool forCurlBackFace = false}) {
-    final panels = _detectedPanelsCache[page] ?? [];
+    final List<ComicPanel> panels = _panelsForPainting(page);
     final Uint8List? bytes = _pageBytes[page];
     // Bytes not here yet (this half is slower than its neighbour): start/join
     // the load. _loadPage calls setState as soon as they arrive, which rebuilds
