@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'services/comic_cache_service.dart';
 import 'services/comic_cover_service.dart';
@@ -69,6 +72,8 @@ enum LibrarySort {
 
 enum _LibraryMenuAction { deleteRead }
 
+enum _FileDeleteOutcome { deleted, skippedExternal, protectedOrLocked }
+
 class ComicProcessorScreen extends StatefulWidget {
   const ComicProcessorScreen({super.key, required this.title});
 
@@ -82,6 +87,8 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   static const String _viewModeKey = 'panelshift.libraryViewMode.v1';
   static const String _bookshelfModeKey = 'panelshift.bookshelfMode.v1';
   static const String _sortKey = 'panelshift.librarySort.v1';
+  static const String _originalSourcesKey = 'panelshift.originalSources.v1';
+  static const MethodChannel _safChannel = MethodChannel('panelshift/saf_picker');
 
   /// Order in which [ComicLibraryService.loadLibrary] returns comics: `true`
   /// when the oldest import comes first (new imports are appended), `false`
@@ -163,6 +170,104 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   }
 
   // ---------------------------------------------------------------------------
+  // Background pre-indexer
+  // ---------------------------------------------------------------------------
+
+  // Comics that appear in the library after it was first loaded this session get
+  // their archive index and page dimensions stored in ComicCacheService, so a
+  // later tap opens without any parsing or header probing. Comics that were
+  // already in the library at launch are indexed the first time they are opened.
+  // Strictly sequential and low priority: it starts only once the library is
+  // idle (no comic being opened or read), after the comic's cover is ready, and
+  // it works in small throttled batches (see ComicParserService.preIndex).
+  bool _preIndexBaselineTaken = false;
+  final Set<String> _preIndexSeen = <String>{};
+  final List<ComicIdentity> _preIndexQueue = <ComicIdentity>[];
+  bool _preIndexRunning = false;
+
+  void _enqueueNewComicsForPreIndex(List<ComicIdentity> library) {
+    final Set<String> ids = <String>{
+      for (final ComicIdentity comic in library) comic.id,
+    };
+    // A comic that left the library may be imported again later: forget it.
+    _preIndexSeen.retainWhere(ids.contains);
+
+    if (!_preIndexBaselineTaken) {
+      _preIndexBaselineTaken = true;
+      _preIndexSeen.addAll(ids);
+      return;
+    }
+    for (final ComicIdentity comic in library) {
+      if (_preIndexSeen.add(comic.id)) _preIndexQueue.add(comic);
+    }
+    if (_preIndexQueue.isNotEmpty) unawaited(_runPreIndexer());
+  }
+
+  bool _isStillInLibrary(String id) =>
+      !_removing.contains(id) &&
+      _library.any((ComicIdentity comic) => comic.id == id);
+
+  /// Holds background work back while a comic is being opened or read
+  /// ([_isProcessing] stays true for the whole reader session).
+  Future<void> _waitUntilLibraryIdle() async {
+    while (mounted && _isProcessing) {
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
+  }
+
+  Future<void> _runPreIndexer() async {
+    if (_preIndexRunning) return;
+    _preIndexRunning = true;
+    try {
+      // Let the new cards' cover requests get going first.
+      await Future<void>.delayed(const Duration(seconds: 2));
+      while (mounted && _preIndexQueue.isNotEmpty) {
+        await _waitUntilLibraryIdle();
+        if (!mounted || _preIndexQueue.isEmpty) break;
+
+        final ComicIdentity comic = _preIndexQueue.removeAt(0);
+        if (!_isStillInLibrary(comic.id)) continue;
+        await _preIndexOne(comic);
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      }
+    } finally {
+      _preIndexRunning = false;
+    }
+  }
+
+  Future<void> _preIndexOne(ComicIdentity comic) async {
+    // 1. Cover thumbnail first (a no-op when it already exists).
+    final ComicCoverService covers = ComicCoverService.instance;
+    try {
+      await covers.request(comic);
+    } catch (e) {
+      debugPrint('PanelShift: pre-index cover failed for ${comic.title}: $e');
+    } finally {
+      covers.release(comic.id);
+    }
+    if (!mounted) return;
+
+    // 2. Then the archive index and page dimensions.
+    await _waitUntilLibraryIdle();
+    if (!mounted || !_isStillInLibrary(comic.id)) return;
+    try {
+      if (await File(comic.sourcePath).exists()) {
+        await ComicParserService.preIndex(
+          comic.sourcePath,
+          gate: _waitUntilLibraryIdle,
+        );
+      }
+    } catch (e) {
+      debugPrint('PanelShift: pre-index failed for ${comic.title}: $e');
+    }
+
+    // Deleted while it was being indexed: do not leave its index behind.
+    if (mounted && !_isStillInLibrary(comic.id)) {
+      await ComicCacheService.instance.deleteIndexCache(comic.id);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // State loading
   // ---------------------------------------------------------------------------
 
@@ -187,6 +292,7 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
       _resort();
     });
     unawaited(_refreshReadTimes());
+    _enqueueNewComicsForPreIndex(library);
   }
 
   Future<void> _loadViewMode() async {
@@ -578,25 +684,233 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     }
   }
 
+  Future<Directory> _managedLibraryDir() async {
+    final Directory supportDir = await getApplicationSupportDirectory();
+    return Directory(
+      '${supportDir.path}${Platform.pathSeparator}imported_comics',
+    );
+  }
+
+  /// Copies a picked archive into persistent app storage so Android's cache
+  /// cleaner cannot delete it from `cache/file_picker/`.
+  Future<String> _persistPickedFile(String pickedPath) async {
+    final Directory libraryDir = await _managedLibraryDir();
+    if (!await libraryDir.exists()) {
+      await libraryDir.create(recursive: true);
+    }
+
+    final String sep = Platform.pathSeparator;
+    final String prefix = '${libraryDir.path}$sep';
+    if (pickedPath.startsWith(prefix)) return pickedPath;
+
+    final String fileName = pickedPath.split(RegExp(r'[\\/]')).last;
+    final File sourceFile = File(pickedPath);
+    final int sourceLength = await sourceFile.length();
+
+    // Reuse an existing managed copy if it has the same name and byte size.
+    File target = File('$prefix$fileName');
+    if (await target.exists()) {
+      if (await target.length() == sourceLength) {
+        return target.path;
+      }
+      // Different file with the same filename: keep the clean filename inside
+      // a unique subfolder so ComicIdentity still reads the original title.
+      final Directory bucket = Directory(
+        '$prefix${DateTime.now().microsecondsSinceEpoch}',
+      );
+      await bucket.create(recursive: true);
+      target = File('${bucket.path}$sep$fileName');
+    }
+
+    await sourceFile.copy(target.path);
+
+    // Remove only file_picker's transient cache copy, never a user folder.
+    if (pickedPath.contains('${sep}file_picker$sep')) {
+      try {
+        await sourceFile.delete();
+      } catch (_) {}
+    }
+
+    return target.path;
+  }
+
+  /// Deletes PanelShift's internal copy (and any leftover picker cache file).
+  /// When [deleteExternal] is true, also attempts to delete external user
+  /// files outside app storage if permitted by the OS.
+  Future<_FileDeleteOutcome> _deleteComicFile(
+      String sourcePath, {
+        required bool deleteExternal,
+      }) async {
+    final Directory libraryDir = await _managedLibraryDir();
+    final Directory tempDir = await getTemporaryDirectory();
+    final String sep = Platform.pathSeparator;
+
+    final String managedPrefix = '${libraryDir.path}$sep';
+    final String pickerCachePrefix = '${tempDir.path}${sep}file_picker$sep';
+
+    final bool isAppOwned =
+        sourcePath.startsWith(managedPrefix) ||
+            sourcePath.startsWith(pickerCachePrefix);
+
+    if (!isAppOwned && !deleteExternal) {
+      return _FileDeleteOutcome.skippedExternal;
+    }
+
+    final File file = File(sourcePath);
+    if (!await file.exists()) {
+      return _FileDeleteOutcome.deleted;
+    }
+
+    try {
+      await file.delete();
+    } on FileSystemException catch (e) {
+      debugPrint('PanelShift: could not delete file "$sourcePath": $e');
+      if (!isAppOwned) {
+        return _FileDeleteOutcome.protectedOrLocked;
+      }
+      rethrow;
+    }
+
+    // If the file lived in a collision subfolder inside imported_comics/,
+    // remove the folder once it is empty.
+    if (sourcePath.startsWith(managedPrefix)) {
+      final Directory parent = file.parent;
+      if (parent.path != libraryDir.path && await parent.exists()) {
+        if (await parent.list().isEmpty) {
+          await parent.delete();
+        }
+      }
+    }
+
+    return _FileDeleteOutcome.deleted;
+  }
+
+  Future _loadOriginalSources() async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      final String? raw = prefs.getString(_originalSourcesKey);
+      if (raw == null || raw.isEmpty) return <String, String>{};
+      final Map<String, dynamic> decoded =
+      jsonDecode(raw) as Map<String, dynamic>;
+      return decoded.map(
+            (String k, dynamic v) => MapEntry<String, String>(k, v.toString()),
+      );
+    } catch (e) {
+      debugPrint('PanelShift: could not load original source map: $e');
+      return <String, String>{};
+    }
+  }
+
+  Future<void> _saveOriginalSource(String comicId, String locator) async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      final Map<String, String> map = await _loadOriginalSources();
+      map[comicId] = locator;
+      await prefs.setString(_originalSourcesKey, jsonEncode(map));
+    } catch (e) {
+      debugPrint('PanelShift: could not save original source locator: $e');
+    }
+  }
+
+  Future<String?> _takeOriginalSource(String comicId) async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      final Map<String, String> map = await _loadOriginalSources();
+      final String? removed = map.remove(comicId);
+      if (removed != null) {
+        await prefs.setString(_originalSourcesKey, jsonEncode(map));
+      }
+      return removed;
+    } catch (e) {
+      debugPrint('PanelShift: could not remove original source locator: $e');
+      return null;
+    }
+  }
+
+  Future<_FileDeleteOutcome> _deleteOriginalLocator(String locator) async {
+    if (locator.startsWith('content://')) {
+      try {
+        final bool? deleted = await _safChannel.invokeMethod<bool>(
+          'deleteUri',
+          <String, Object?>{'uri': locator},
+        );
+        return deleted == true
+            ? _FileDeleteOutcome.deleted
+            : _FileDeleteOutcome.protectedOrLocked;
+      } catch (e) {
+        debugPrint('PanelShift: SAF URI delete failed for "$locator": $e');
+        return _FileDeleteOutcome.protectedOrLocked;
+      }
+    }
+
+    final File originalFile = File(locator);
+    if (!await originalFile.exists()) {
+      return _FileDeleteOutcome.deleted;
+    }
+    try {
+      await originalFile.delete();
+      return _FileDeleteOutcome.deleted;
+    } on FileSystemException catch (e) {
+      debugPrint('PanelShift: original file delete failed for "$locator": $e');
+      return _FileDeleteOutcome.protectedOrLocked;
+    }
+  }
+
+  static const Set<String> _supportedExtensions = <String>{
+    'cbz',
+    'zip',
+    'cbr',
+    'rar',
+  };
+
   Future<void> _pickAndProcessComic() {
     return _runProcessing('Opening file manager...', () async {
-      final files = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['cbz', 'zip', 'cbr', 'rar'],
-      );
+      String? pickedTempPath;
+      String? originalLocator;
 
-      if (files.isEmpty || files.first.path == null) {
-        _notify('File selection cancelled.');
-        return;
+      if (Platform.isAndroid) {
+        final Map<String, dynamic>? picked =
+        await _safChannel.invokeMapMethod<String, dynamic>('pickComic');
+        if (picked == null || picked['tempPath'] == null) {
+          _notify('File selection cancelled.');
+          return;
+        }
+        pickedTempPath = picked['tempPath'] as String;
+        originalLocator = picked['uri'] as String?;
+
+        final String ext = pickedTempPath.split('.').last.toLowerCase();
+        if (!_supportedExtensions.contains(ext)) {
+          try {
+            await File(pickedTempPath).delete();
+          } catch (_) {}
+          _notify('Please select a .cbz, .zip, .cbr, or .rar file.');
+          return;
+        }
+      } else {
+        final files = await FilePicker.pickFiles(
+          type: FileType.custom,
+          allowedExtensions: ['cbz', 'zip', 'cbr', 'rar'],
+        );
+
+        if (files.isEmpty || files.first.path == null) {
+          _notify('File selection cancelled.');
+          return;
+        }
+        pickedTempPath = files.first.path!;
+        // On desktop, FilePicker returns the real original directory path.
+        originalLocator = pickedTempPath;
       }
 
-      final filePath = files.first.path!;
-      if (!await File(filePath).exists()) {
+      if (!await File(pickedTempPath).exists()) {
         _notify('Selected file could not be found on disk.');
         return;
       }
 
-      await _extractAndOpen(filePath);
+      if (mounted) {
+        setState(() => _busyMessage = 'Importing comic into library...');
+      }
+      final String persistentPath = await _persistPickedFile(pickedTempPath);
+      await _extractAndOpen(persistentPath, originalLocator: originalLocator);
     });
   }
 
@@ -613,12 +927,18 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   /// Indexes [filePath], registers it in the library, opens the reader (which
   /// restores the saved position by itself) and releases the extraction once
   /// the reader is closed.
-  Future<void> _extractAndOpen(String filePath) async {
+  Future<void> _extractAndOpen(
+      String filePath, {
+        String? originalLocator,
+      }) async {
     if (mounted) {
       setState(() => _busyMessage = 'Indexing comic archive...');
     }
 
-    final LoadedComic loaded = await ComicParserService.loadComic(filePath);
+    final LoadedComic loaded = await ComicParserService.loadComic(
+      filePath,
+      retainCbrCache: true,
+    );
 
     try {
       if (loaded.source.pageCount <= 0) {
@@ -633,6 +953,10 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
       // 2. Register in the library (idempotent: dedupes by comic id, refreshes
       //    the stored path if the same comic was re-picked from elsewhere).
       await ComicLibraryService.addComic(loaded.identity);
+
+      if (originalLocator != null && originalLocator.isNotEmpty) {
+        await _saveOriginalSource(loaded.identity.id, originalLocator);
+      }
 
       if (!mounted) return;
       await Navigator.push(
@@ -654,29 +978,33 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     if (_isProcessing) return;
 
     final bool? confirmed = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext dialogContext) => AlertDialog(
-        title: const Text('Remove from library?'),
-        content: Text(
-          '"${comic.title}" will be removed from your library. The file '
-          'itself is not deleted, and your reading position is kept.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Remove'),
-          ),
-        ],
+    context: context,
+    builder: (BuildContext dialogContext) => AlertDialog(
+      title: const Text('Remove from library?'),
+      content: Text(
+        '"${comic.title}" and PanelShift\'s internal copy will be removed. '
+            'Any original file in your external folders is not deleted, and '
+            'your reading position is kept.',
       ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(dialogContext, true),
+          child: const Text('Remove'),
+        ),
+      ],
+    ),
     );
     if (confirmed != true) return;
 
+    _preIndexQueue.removeWhere((ComicIdentity c) => c.id == comic.id);
     await ComicLibraryService.removeComic(comic.id);
     await ComicCoverService.instance.delete(comic.id);
+    await ComicCacheService.instance.deleteIndexCache(comic.id);
+    await _deleteComicFile(comic.sourcePath, deleteExternal: false);
   }
 
   // ---------------------------------------------------------------------------
@@ -754,65 +1082,96 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
         .map((ComicIdentity c) => c.title)
         .toList(growable: false);
 
+    bool deleteExternalFiles = false;
     final bool? confirmed = await showDialog<bool>(
       context: context,
       builder: (BuildContext dialogContext) {
         final ColorScheme scheme = Theme.of(dialogContext).colorScheme;
-        return AlertDialog(
-          icon: Icon(Icons.delete_sweep_outlined, color: scheme.error),
-          title: Text(count == 1 ? 'Delete 1 read comic?' : 'Delete $count read comics?'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Finished comics will be removed from your library, along '
-                  'with their reading progress, covers and cached data. The '
-                  'comic files themselves are not deleted. This cannot be '
-                  'undone.',
-                ),
-                const SizedBox(height: 12),
-                for (final String title in preview)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 2),
-                    child: Text(
-                      '• $title',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                if (count > preview.length)
-                  Text('...and ${count - preview.length} more'),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: scheme.error,
-                foregroundColor: scheme.onError,
+        return StatefulBuilder(
+          builder: (BuildContext context, StateSetter setDialogState) {
+            return AlertDialog(
+              icon: Icon(Icons.delete_sweep_outlined, color: scheme.error),
+              title: Text(
+                count == 1 ? 'Delete 1 read comic?' : 'Delete $count read comics?',
               ),
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Delete'),
-            ),
-          ],
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      deleteExternalFiles
+                          ? 'Finished comics, PanelShift\'s internal data, AND '
+                          'original external comic files (where permitted by '
+                          'your OS) will be permanently deleted. This cannot '
+                          'be undone.'
+                          : 'Finished comics will be completely wiped from '
+                          'PanelShift (library entry, internal copy, reading '
+                          'progress, covers, and cached data). Original '
+                          'external files in folders like Downloads will not '
+                          'be touched.',
+                    ),
+                    const SizedBox(height: 12),
+                    for (final String title in preview)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        child: Text(
+                          '• $title',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    if (count > preview.length)
+                      Text('...and ${count - preview.length} more'),
+                    const SizedBox(height: 8),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      dense: true,
+                      value: deleteExternalFiles,
+                      title: const Text(
+                        'Also delete original external files (when permitted)',
+                      ),
+                      onChanged: (bool? checked) {
+                        setDialogState(() {
+                          deleteExternalFiles = checked ?? false;
+                        });
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: scheme.error,
+                    foregroundColor: scheme.onError,
+                  ),
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: const Text('Delete'),
+                ),
+              ],
+            );
+          },
         );
       },
     );
     if (confirmed != true || !mounted) return;
 
-    await _deleteComics(finished);
+    await _deleteComics(finished, deleteExternalFiles: deleteExternalFiles);
   }
 
-  /// Removes every comic in [comics] from the registry, the cover store and
-  /// the reading-progress store, then sweeps the extraction cache. The cards
-  /// disappear immediately; the storage work happens afterwards.
-  Future<void> _deleteComics(List<ComicIdentity> comics) async {
+  /// Removes every comic in [comics] from the registry, the cover store, the
+  /// reading-progress store, and PanelShift's internal file storage, then
+  /// sweeps the extraction cache.
+  Future<void> _deleteComics(
+      List<ComicIdentity> comics, {
+        required bool deleteExternalFiles,
+      }) async {
     setState(() {
       _isProcessing = true;
       _busyMessage = comics.length == 1
@@ -823,14 +1182,20 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     });
 
     int failed = 0;
+    int protectedFiles = 0;
     try {
       // Sequential on purpose: registry removals are read-modify-write.
       for (final ComicIdentity comic in comics) {
-        if (!await _purgeComic(comic.id)) failed++;
+        final ({bool ok, bool externalProtected}) result = await _purgeComic(
+          comic,
+          deleteExternalFiles: deleteExternalFiles,
+        );
+        if (!result.ok) failed++;
+        if (result.externalProtected) protectedFiles++;
       }
 
-      // The registry no longer lists these comics, so their extraction cache
-      // is now orphaned and gets swept.
+      // The registry no longer lists these comics, so any retained CBR
+      // extraction folders in cache are now orphaned and get swept.
       try {
         await ComicCacheService.instance.purgeOrphans();
       } catch (e) {
@@ -855,20 +1220,29 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     }
 
     final int deleted = comics.length - failed;
-    _notify(
-      failed == 0
-          ? (deleted == 1
-                ? 'Deleted 1 read comic.'
-                : 'Deleted $deleted read comics.')
-          : 'Deleted $deleted, but $failed could not be fully removed.',
-    );
+    if (failed > 0) {
+      _notify('Deleted $deleted, but $failed could not be fully removed.');
+    } else if (protectedFiles > 0) {
+      _notify(
+        'Deleted $deleted read comic(s) ($protectedFiles external file(s) '
+            'protected by OS).',
+      );
+    } else {
+      _notify(
+        deleted == 1 ? 'Deleted 1 read comic.' : 'Deleted $deleted read comics.',
+      );
+    }
   }
 
-  /// Registry entry, cover and reading progress of one comic. Returns false if
-  /// any step failed (the others still run, except when the registry removal
-  /// itself fails: then the comic stays intact).
-  Future<bool> _purgeComic(String id) async {
+  /// Wipes registry entry, cover, reading progress, cached archive index,
+  /// retained CBR extraction, and the comic file for one entry.
+  Future<({bool ok, bool externalProtected})> _purgeComic(
+      ComicIdentity comic, {
+        required bool deleteExternalFiles,
+      }) async {
+    final String id = comic.id;
     bool ok = true;
+    bool externalProtected = false;
 
     Future<bool> step(Future<void> Function() action) async {
       try {
@@ -881,10 +1255,26 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
       }
     }
 
-    if (!await step(() => ComicLibraryService.removeComic(id))) return false;
+    _preIndexQueue.removeWhere((ComicIdentity c) => c.id == id);
+    if (!await step(() => ComicLibraryService.removeComic(id))) {
+      return (ok: false, externalProtected: false);
+    }
     await step(() => ComicCoverService.instance.delete(id));
     await step(() => ReadingProgressService.clear(id));
-    return ok;
+    await step(() => ComicCacheService.instance.deleteIndexCache(id));
+    await step(() async {
+      await _deleteComicFile(comic.sourcePath, deleteExternal: false);
+      final String? originalLocator = await _takeOriginalSource(id);
+      if (deleteExternalFiles && originalLocator != null) {
+        final _FileDeleteOutcome outcome = await _deleteOriginalLocator(
+          originalLocator,
+        );
+        if (outcome == _FileDeleteOutcome.protectedOrLocked) {
+          externalProtected = true;
+        }
+      }
+    });
+    return (ok: ok, externalProtected: externalProtected);
   }
 
   // ---------------------------------------------------------------------------

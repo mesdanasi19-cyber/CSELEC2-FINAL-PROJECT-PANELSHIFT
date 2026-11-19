@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:io' as io; // io.ZLibDecoder: unambiguous next to package:archive
 import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:rar/rar.dart';
 
 import 'comic_cache_service.dart';
@@ -15,16 +17,37 @@ import 'isolate_rpc.dart';
 
 enum ComicArchiveFormat { zip, rar, unknown }
 
+/// Optional capability of a [ComicPageSource]: measure a contiguous range of
+/// pages from their image headers only, without decoding or fully reading them.
+///
+/// The reader uses it to probe the pages around the reading position first and
+/// the rest in small, throttled batches, instead of one all-pages sweep.
+abstract class PageDimensionProbe {
+  /// Dimensions of pages `[start, start + count)`; null where a header could not
+  /// be parsed. The list always has exactly [count] entries.
+  Future<List<PageDimensions?>> probeDimensions(int start, int count);
+}
+
 /// Result of opening a comic file.
 ///
 /// Opening builds the page index; page bytes are read lazily through [source].
 /// Call [close] when the reader is dismissed.
 class LoadedComic {
-  LoadedComic({required this.source, required this.identity, this.cacheKey});
+  LoadedComic({
+    required this.source,
+    required this.identity,
+    this.cacheKey,
+    this.retainCache = false,
+  });
 
   final ComicPageSource source;
   final ComicIdentity identity;
   final String? cacheKey;
+
+  /// When true, [close] keeps the extracted CBR folder (flagged as retained, so
+  /// the next open skips the RAR extraction) instead of deleting it. The folder
+  /// is still subject to [ComicCacheService.maxCacheBytes] eviction.
+  final bool retainCache;
 
   Future<void>? _closeFuture;
 
@@ -37,7 +60,7 @@ class LoadedComic {
     } finally {
       final String? key = cacheKey;
       if (key != null) {
-        await ComicCacheService.instance.release(key);
+        await ComicCacheService.instance.release(key, keep: retainCache);
       }
     }
   }
@@ -58,10 +81,38 @@ class ComicParserService {
 
   /// Opens a .cbz/.zip/.cbr/.rar file. The format is detected from its magic
   /// bytes, with the extension used only when the header is unrecognised.
+  ///
+  /// The page index is cached by comic id ([ComicCacheService.readIndexCache]),
+  /// so renamed or moved files keep it while modified files miss automatically:
+  ///  * .cbz: a cached index is hydrated directly (one small JSON read, no
+  ///    archive parsing). The page-reader isolate is started in the background
+  ///    and is not on the open path.
+  ///  * .cbr: a cached index is used only if its extracted folder is still in
+  ///    `panelshift_cbr_cache` with every page; otherwise the archive is fully
+  ///    extracted up front exactly as before and the index is refreshed.
+  ///
+  /// [retainCbrCache] keeps a freshly extracted CBR folder after
+  /// [LoadedComic.close] so the next open is instant. Callers that only peek at
+  /// a comic (thumbnails) should leave it false.
   static Future<LoadedComic> loadComic(
     String filePath, {
     Duration? rarExtractionTimeout = defaultRarExtractionTimeout,
     Duration? archiveIndexTimeout = defaultArchiveIndexTimeout,
+    bool retainCbrCache = false,
+  }) => _loadComic(
+    filePath,
+    rarExtractionTimeout: rarExtractionTimeout,
+    archiveIndexTimeout: archiveIndexTimeout,
+    retainCbrCache: retainCbrCache,
+    waitForIndexJob: true,
+  );
+
+  static Future<LoadedComic> _loadComic(
+    String filePath, {
+    required Duration? rarExtractionTimeout,
+    required Duration? archiveIndexTimeout,
+    required bool retainCbrCache,
+    required bool waitForIndexJob,
   }) async {
     final Future<ComicIdentity> identityFuture = ComicIdentity.fromFile(
       filePath,
@@ -75,7 +126,24 @@ class ComicParserService {
     final ComicIdentity identity = both[0] as ComicIdentity;
     final ComicArchiveFormat format = both[1] as ComicArchiveFormat;
 
+    // A background pre-index of this very comic is already doing the work the
+    // open would do. Wait for it instead of duplicating it (never fails the open).
+    if (waitForIndexJob) {
+      final Future<void>? running = _indexJobs[identity.id];
+      if (running != null) {
+        try {
+          await running;
+        } catch (_) {}
+      }
+    }
+
+    final ComicCacheService cache = ComicCacheService.instance;
+    final Map<String, dynamic>? index = await cache.readIndexCache(identity.id);
+
     if (format == ComicArchiveFormat.rar) {
+      final LoadedComic? cached = await _hydrateCbr(cache, identity, index);
+      if (cached != null) return cached;
+
       // Each extraction gets a distinct folder. A timed-out native operation
       // may finish late; it must never collide with a subsequent open of the
       // same comic identity.
@@ -86,15 +154,248 @@ class ComicParserService {
         extractionTimeout: rarExtractionTimeout,
         indexingTimeout: archiveIndexTimeout,
       );
+      if (retainCbrCache && source is FilePageSource) {
+        unawaited(_persistCbrIndex(cache, identity.id, extractionKey, source));
+      }
       return LoadedComic(
         source: source,
         identity: identity,
         cacheKey: extractionKey,
+        retainCache: retainCbrCache,
       );
     }
 
-    final ComicPageSource source = await ZipPageSource.open(filePath);
+    final ZipPageSource? cachedZip = await _hydrateZip(
+      cache,
+      filePath,
+      identity,
+      index,
+    );
+    if (cachedZip != null) {
+      return LoadedComic(source: cachedZip, identity: identity);
+    }
+
+    final ZipPageSource source = await ZipPageSource.open(filePath);
+    unawaited(_persistZipIndex(cache, identity.id, source));
     return LoadedComic(source: source, identity: identity);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Index cache: hydrate / persist
+  // ---------------------------------------------------------------------------
+
+  /// Rebuilds a [ZipPageSource] from the stored index. Requires the archive to
+  /// still exist at [filePath] with the length it had when it was indexed.
+  /// Costs one stat plus the JSON decode already done by the caller.
+  static Future<ZipPageSource?> _hydrateZip(
+    ComicCacheService cache,
+    String filePath,
+    ComicIdentity identity,
+    Map<String, dynamic>? index,
+  ) async {
+    final Object? raw = index?['source'];
+    if (raw is! Map<String, dynamic> || raw['type'] != 'zip') return null;
+
+    final ZipPageSource? source = ZipPageSource.fromJson(raw, filePath);
+    if (source == null || source.pageCount <= 0) return null;
+
+    final int actualLength;
+    try {
+      actualLength = await File(filePath).length();
+    } on FileSystemException {
+      return null;
+    }
+    if (actualLength != source.indexedFileLength) return null;
+
+    source.onIndexStale = () => unawaited(cache.deleteIndexCache(identity.id));
+    source.onIndexRefreshed = () =>
+        unawaited(_persistZipIndex(cache, identity.id, source));
+    unawaited(source.warmUp());
+    return source;
+  }
+
+  /// Re-opens a retained extraction folder when it is intact. Returns null (and
+  /// removes a damaged folder) so the caller falls back to a normal extraction.
+  static Future<LoadedComic?> _hydrateCbr(
+    ComicCacheService cache,
+    ComicIdentity identity,
+    Map<String, dynamic>? index,
+  ) async {
+    final Object? raw = index?['source'];
+    if (raw is! Map<String, dynamic> || raw['type'] != 'cbr') return null;
+    final Object? storedRoot = raw['root'];
+    if (storedRoot is! String || storedRoot.isEmpty) return null;
+
+    final String key = storedRoot.split(RegExp(r'[\\/]')).last;
+    final Directory? dir = await cache.acquireRetained(key);
+    if (dir == null) return null; // Evicted, unfinished or in use elsewhere.
+
+    bool usable = false;
+    try {
+      // Use the live path of the folder, not the stored one: the app's
+      // temporary directory can move between installs/restores.
+      final FilePageSource? source = FilePageSource.fromJson(raw, dir.path);
+      if (source != null && source.pageCount > 0) {
+        final int onDisk = await _countPageFiles(dir.path);
+        if (onDisk == source.pageCount) {
+          usable = true;
+          return LoadedComic(
+            source: source,
+            identity: identity,
+            cacheKey: key,
+            retainCache: true,
+          );
+        }
+      }
+      return null;
+    } catch (error) {
+      debugPrint('ComicParserService: retained folder unusable: $error');
+      return null;
+    } finally {
+      // A folder that no longer matches its index is deleted, not retained.
+      if (!usable) await cache.release(key, keep: false);
+    }
+  }
+
+  static Future<void> _persistZipIndex(
+    ComicCacheService cache,
+    String comicId,
+    ZipPageSource source,
+  ) async {
+    final Map<String, dynamic>? json = source.toJson();
+    if (json == null) return; // Fallback decoder: no reusable offsets.
+    await cache.mergeIndexCache(comicId, <String, dynamic>{
+      'pageCount': source.pageCount,
+      'source': json,
+    });
+  }
+
+  static Future<void> _persistCbrIndex(
+    ComicCacheService cache,
+    String comicId,
+    String cacheKey,
+    FilePageSource source,
+  ) async {
+    // Marker first: a folder that is indexed must also survive an app restart.
+    await cache.markRetained(cacheKey);
+    await cache.mergeIndexCache(comicId, <String, dynamic>{
+      'pageCount': source.pageCount,
+      'source': source.toJson(),
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Background pre-indexing
+  // ---------------------------------------------------------------------------
+
+  static final Map<String, Future<void>> _indexJobs = <String, Future<void>>{};
+
+  /// Pages measured per micro-batch, and the pause between batches.
+  static const int preIndexBatchPages = 8;
+  static const Duration preIndexBatchPause = Duration(milliseconds: 40);
+
+  /// Archives larger than this are not unpacked in the background; they are
+  /// extracted when the user opens them.
+  static const int preIndexMaxCbrBytes = 200 * 1024 * 1024;
+
+  /// Builds and stores the page index and every page's dimensions of one comic
+  /// so a later [loadComic] and the reader open without any header I/O.
+  ///
+  /// Low priority by design: sequential, 8 pages per micro-batch, a pause
+  /// between batches, and [gate] is awaited before each batch (the caller can
+  /// hold work back while a reader is on screen). Concurrent [loadComic] calls
+  /// for the same comic wait for this job instead of repeating it. Never throws.
+  static Future<void> preIndex(
+    String filePath, {
+    bool extractCbr = true,
+    Future<void> Function()? gate,
+  }) async {
+    try {
+      final ComicIdentity identity = await ComicIdentity.fromFile(filePath);
+      final Future<void>? running = _indexJobs[identity.id];
+      if (running != null) {
+        await running;
+        return;
+      }
+
+      final Future<void> job = _preIndex(
+        filePath,
+        identity,
+        extractCbr: extractCbr,
+        gate: gate,
+      );
+      _indexJobs[identity.id] = job;
+      try {
+        await job;
+      } finally {
+        _indexJobs.remove(identity.id);
+      }
+    } catch (error) {
+      debugPrint('ComicParserService.preIndex failed for $filePath: $error');
+    }
+  }
+
+  static Future<void> _preIndex(
+    String filePath,
+    ComicIdentity identity, {
+    required bool extractCbr,
+    required Future<void> Function()? gate,
+  }) async {
+    final ComicCacheService cache = ComicCacheService.instance;
+    if (_hasCompleteDimensions(await cache.readIndexCache(identity.id))) return;
+
+    if (await detectFormat(filePath) == ComicArchiveFormat.rar) {
+      if (!extractCbr) return;
+      if (await File(filePath).length() > preIndexMaxCbrBytes) return;
+    }
+
+    final LoadedComic loaded = await _loadComic(
+      filePath,
+      rarExtractionTimeout: defaultRarExtractionTimeout,
+      archiveIndexTimeout: defaultArchiveIndexTimeout,
+      retainCbrCache: true,
+      waitForIndexJob: false,
+    );
+    try {
+      final Object source = loaded.source;
+      final int count = loaded.source.pageCount;
+      if (count <= 0 || source is! PageDimensionProbe) return;
+
+      final List<List<int>> dimensions = <List<int>>[];
+      for (int start = 0; start < count; start += preIndexBatchPages) {
+        if (gate != null) await gate();
+        final int batch = math.min(preIndexBatchPages, count - start);
+        final List<PageDimensions?> part = await source.probeDimensions(
+          start,
+          batch,
+        );
+        for (final PageDimensions? d in part) {
+          dimensions.add(d == null ? <int>[0, 0] : <int>[d.width, d.height]);
+        }
+        await Future<void>.delayed(preIndexBatchPause);
+      }
+
+      await cache.mergeIndexCache(identity.id, <String, dynamic>{
+        'pageCount': count,
+        'dimensions': dimensions,
+      });
+    } finally {
+      await loaded.close();
+    }
+  }
+
+  static bool _hasCompleteDimensions(Map<String, dynamic>? index) {
+    final Object? dims = index?['dimensions'];
+    final Object? count = index?['pageCount'];
+    if (dims is! List || count is! int || count <= 0) return false;
+    if (dims.length != count) return false;
+    for (final Object? pair in dims) {
+      if (pair is! List || pair.length < 2) return false;
+      final Object? w = pair[0];
+      final Object? h = pair[1];
+      if (w is! int || h is! int || w <= 0 || h <= 0) return false;
+    }
+    return true;
   }
 
   static String _newExtractionKey(String identity) {
@@ -285,17 +586,174 @@ class ComicParserService {
 const int _dimsChunk = 24;
 const int _sniffBytes = 64 * 1024;
 
-class ZipPageSource implements ComicPageSource {
-  ZipPageSource._(this._rpc, this.pageCount);
+/// Compact page index of a ZIP archive: parallel arrays in reading order
+/// (natural sort applied), one slot per page image. This is both the on-disk
+/// JSON form and the wire form sent to the reader isolate.
+class _ZipIndex {
+  const _ZipIndex({
+    required this.names,
+    required this.offsets,
+    required this.compressedSizes,
+    required this.uncompressedSizes,
+    required this.methods,
+  });
 
-  final IsolateRpc _rpc;
+  final List<String> names;
+  final List<int> offsets; // localHeaderOffset
+  final List<int> compressedSizes;
+  final List<int> uncompressedSizes;
+  final List<int> methods; // 0 = stored, 8 = deflate
+
+  int get length => names.length;
+
+  factory _ZipIndex.fromEntries(List<_ZipEntry> entries) => _ZipIndex(
+    names: <String>[for (final _ZipEntry e in entries) e.name],
+    offsets: <int>[for (final _ZipEntry e in entries) e.localHeaderOffset],
+    compressedSizes: <int>[for (final _ZipEntry e in entries) e.compressedSize],
+    uncompressedSizes: <int>[
+      for (final _ZipEntry e in entries) e.uncompressedSize,
+    ],
+    methods: <int>[for (final _ZipEntry e in entries) e.method],
+  );
+
+  /// Validates untrusted JSON / wire data. Returns null for anything that is not
+  /// a self-consistent index, so a damaged cache entry is simply a cache miss.
+  static _ZipIndex? tryParse(
+    Object? names,
+    Object? offsets,
+    Object? compressedSizes,
+    Object? uncompressedSizes,
+    Object? methods,
+  ) {
+    if (names is! List ||
+        offsets is! List ||
+        compressedSizes is! List ||
+        uncompressedSizes is! List ||
+        methods is! List) {
+      return null;
+    }
+    final int count = names.length;
+    if (count == 0 ||
+        offsets.length != count ||
+        compressedSizes.length != count ||
+        uncompressedSizes.length != count ||
+        methods.length != count) {
+      return null;
+    }
+
+    try {
+      final List<int> offsetList = <int>[for (final Object? v in offsets) v as int];
+      final List<int> compressedList = <int>[
+        for (final Object? v in compressedSizes) v as int,
+      ];
+      final List<int> uncompressedList = <int>[
+        for (final Object? v in uncompressedSizes) v as int,
+      ];
+      final List<int> methodList = <int>[for (final Object? v in methods) v as int];
+      for (int i = 0; i < count; i++) {
+        if (offsetList[i] < 0 ||
+            compressedList[i] < 0 ||
+            uncompressedList[i] < 0 ||
+            (methodList[i] != 0 && methodList[i] != 8)) {
+          return null;
+        }
+      }
+      return _ZipIndex(
+        names: <String>[for (final Object? v in names) v as String],
+        offsets: offsetList,
+        compressedSizes: compressedList,
+        uncompressedSizes: uncompressedList,
+        methods: methodList,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  List<_ZipEntry> toEntries() => <_ZipEntry>[
+    for (int i = 0; i < length; i++)
+      _ZipEntry(
+        names[i],
+        methods[i],
+        compressedSizes[i],
+        offsets[i],
+        uncompressedSizes[i],
+      ),
+  ];
+
+  List<Object?> toWire() => <Object?>[
+    names,
+    offsets,
+    compressedSizes,
+    uncompressedSizes,
+    methods,
+  ];
+}
+
+/// Reply of the worker's `open` operation: the page count and, when the fast
+/// central-directory path was used, the page index.
+class _OpenReply {
+  const _OpenReply(this.count, this.index);
+
+  final int count;
+  final _ZipIndex? index;
+}
+
+_OpenReply? _parseOpenReply(Object? reply) {
+  if (reply is int) return _OpenReply(reply, null);
+  if (reply is! List || reply.isEmpty) return null;
+  final Object? count = reply[0];
+  if (count is! int) return null;
+  if (reply.length < 6) return _OpenReply(count, null);
+  final _ZipIndex? index = _ZipIndex.tryParse(
+    reply[1],
+    reply[2],
+    reply[3],
+    reply[4],
+    reply[5],
+  );
+  return _OpenReply(count, index != null && index.length == count ? index : null);
+}
+
+class ZipPageSource implements ComicPageSource, PageDimensionProbe {
+  ZipPageSource._({
+    required this.pageCount,
+    required String filePath,
+    required int fileLength,
+    IsolateRpc? rpc,
+    _ZipIndex? index,
+  }) : _filePath = filePath,
+       _fileLength = fileLength,
+       _rpc = rpc,
+       _index = index;
 
   @override
   final int pageCount;
 
+  final String _filePath;
+  final int _fileLength;
+  _ZipIndex? _index;
+
+  // Null for a source hydrated from the index cache until its worker has been
+  // started (see [_worker]); never replaced once set.
+  IsolateRpc? _rpc;
+  Future<IsolateRpc>? _workerFuture;
+
   bool _disposed = false;
 
+  /// Called once if a cached index turns out not to match the archive, so the
+  /// owner can drop the stale entry. The source itself heals by re-parsing.
+  void Function()? onIndexStale;
+
+  /// Called when a stale cached index was rebuilt from the archive so the
+  /// owner can persist the updated offsets.
+  void Function()? onIndexRefreshed;
+
+  /// Length of the archive when this index was built (cache validation).
+  int get indexedFileLength => _fileLength;
+
   static Future<ZipPageSource> open(String filePath) async {
+    final int length = await File(filePath).length();
     final IsolateRpc rpc = await IsolateRpc.spawn(
       _zipWorkerMain,
       null,
@@ -303,13 +761,139 @@ class ZipPageSource implements ComicPageSource {
     );
 
     try {
-      final int? count = await rpc.callWithTimeout<int>('open', args: filePath);
-      if (count == null || count < 0) {
+      final Object? reply = await rpc.callWithTimeout<Object>(
+        'open',
+        args: filePath,
+      );
+      final _OpenReply? parsed = _parseOpenReply(reply);
+      if (parsed == null || parsed.count < 0) {
         throw const FormatException(
           'ZIP worker returned an invalid page count',
         );
       }
-      return ZipPageSource._(rpc, count);
+      return ZipPageSource._(
+        pageCount: parsed.count,
+        filePath: filePath,
+        fileLength: length,
+        rpc: rpc,
+        index: parsed.index,
+      );
+    } catch (_) {
+      await rpc.dispose();
+      rethrow;
+    }
+  }
+
+  /// Serialises the page index: sorted entry names plus, per page,
+  /// `localHeaderOffset`, `compressedSize`, `uncompressedSize` and
+  /// `compressionMethod` as parallel arrays. Null when the archive needed the
+  /// full ZIP decoder (ZIP64, encrypted...), which has no reusable offsets.
+  Map<String, dynamic>? toJson() {
+    final _ZipIndex? index = _index;
+    if (index == null) return null;
+    return <String, dynamic>{
+      'type': 'zip',
+      'length': _fileLength,
+      'names': index.names,
+      'offsets': index.offsets,
+      'csizes': index.compressedSizes,
+      'usizes': index.uncompressedSizes,
+      'methods': index.methods,
+    };
+  }
+
+  /// Rebuilds a source from [toJson] output for the archive now at [filePath]
+  /// (it may have been renamed or moved). Costs no archive I/O and no isolate:
+  /// the reader worker is started lazily, in the background. Returns null for
+  /// anything that is not a valid index.
+  static ZipPageSource? fromJson(Object? json, String filePath) {
+    if (json is! Map<String, dynamic> || json['type'] != 'zip') return null;
+    final Object? length = json['length'];
+    if (length is! int || length < 0) return null;
+    final _ZipIndex? index = _ZipIndex.tryParse(
+      json['names'],
+      json['offsets'],
+      json['csizes'],
+      json['usizes'],
+      json['methods'],
+    );
+    if (index == null) return null;
+    return ZipPageSource._(
+      pageCount: index.length,
+      filePath: filePath,
+      fileLength: length,
+      index: index,
+    );
+  }
+
+  /// Starts the reader isolate ahead of the first page read. Never throws; a
+  /// real failure resurfaces from the read that needs the worker.
+  Future<void> warmUp() async {
+    try {
+      await _worker();
+    } catch (_) {}
+  }
+
+  Future<IsolateRpc> _worker() {
+    final IsolateRpc? ready = _rpc;
+    if (ready != null) return Future<IsolateRpc>.value(ready);
+
+    final Future<IsolateRpc>? pending = _workerFuture;
+    if (pending != null) return pending;
+
+    final Future<IsolateRpc> future = _spawnAttached();
+    _workerFuture = future;
+    future.then<void>(
+      (_) {},
+      onError: (Object _) {
+        // Allow a later call to retry instead of caching the failure.
+        if (identical(_workerFuture, future)) _workerFuture = null;
+      },
+    );
+    return future;
+  }
+
+  /// Spawns the worker and hands it the cached index, so it only opens the file
+  /// (no central-directory parse, no sorting). If the archive no longer matches
+  /// the index, the worker parses it from scratch and [onIndexStale] fires.
+  Future<IsolateRpc> _spawnAttached() async {
+    final _ZipIndex index = _index!;
+    final IsolateRpc rpc = await IsolateRpc.spawn(
+      _zipWorkerMain,
+      null,
+      debugName: 'cbz-reader',
+    );
+
+    try {
+      int? count;
+      try {
+        count = await rpc.callWithTimeout<int>(
+          'attach',
+          args: <Object?>[_filePath, ...index.toWire()],
+        );
+      } catch (_) {
+        count = null;
+      }
+      if (count == null) {
+        // Only drop the cached entry when the worker is still alive and
+        // actively rejected the offsets (not on a timeout or worker crash).
+        if (!rpc.isClosed) onIndexStale?.call();
+        final Object? reply = await rpc.callWithTimeout<Object>(
+          'open',
+          args: _filePath,
+        );
+        final _OpenReply? parsed = _parseOpenReply(reply);
+        count = parsed?.count;
+        if (count == pageCount && parsed?.index != null) {
+          _index = parsed!.index;
+          onIndexRefreshed?.call();
+        }
+      }
+      if (count != pageCount) {
+        throw const FormatException('ZIP index no longer matches the archive');
+      }
+      _rpc = rpc;
+      return rpc;
     } catch (_) {
       await rpc.dispose();
       rethrow;
@@ -323,12 +907,32 @@ class ZipPageSource implements ComicPageSource {
       throw RangeError.range(index, 0, pageCount - 1, 'index');
     }
 
-    final TransferableTypedData? data = await _rpc
+    final IsolateRpc rpc = await _worker();
+    final TransferableTypedData? data = await rpc
         .callWithTimeout<TransferableTypedData>('read', args: index);
     if (data == null) {
       throw StateError('Worker returned no data for page $index');
     }
     return data.materialize().asUint8List();
+  }
+
+  @override
+  Future<List<PageDimensions?>> probeDimensions(int start, int count) async {
+    if (_disposed) throw StateError('ZIP page source is disposed');
+    if (start < 0 || count < 0 || start + count > pageCount) {
+      throw RangeError('Invalid dimensions range: $start + $count of $pageCount');
+    }
+    if (count == 0) return const <PageDimensions?>[];
+
+    final IsolateRpc rpc = await _worker();
+    final Int32List? part = await rpc.callWithTimeout<Int32List>(
+      'dims',
+      args: <int>[start, count],
+    );
+    if (part == null || part.length != count * 2) {
+      throw const FormatException('ZIP worker returned invalid dimensions');
+    }
+    return _decodeDims(part);
   }
 
   @override
@@ -338,14 +942,7 @@ class ZipPageSource implements ComicPageSource {
     final List<PageDimensions?> out = <PageDimensions?>[];
     for (int start = 0; start < pageCount; start += _dimsChunk) {
       final int count = math.min(_dimsChunk, pageCount - start);
-      final Int32List? part = await _rpc.callWithTimeout<Int32List>(
-        'dims',
-        args: <int>[start, count],
-      );
-      if (part == null || part.length != count * 2) {
-        throw const FormatException('ZIP worker returned invalid dimensions');
-      }
-      out.addAll(_decodeDims(part));
+      out.addAll(await probeDimensions(start, count));
     }
     return out;
   }
@@ -355,17 +952,30 @@ class ZipPageSource implements ComicPageSource {
     if (_disposed) return;
     _disposed = true;
 
+    IsolateRpc? rpc = _rpc;
+    if (rpc == null) {
+      // A hydrated source whose worker is still starting: wait for it so it can
+      // be shut down instead of leaking. No worker at all means nothing to do.
+      final Future<IsolateRpc>? pending = _workerFuture;
+      if (pending != null) {
+        try {
+          rpc = await pending;
+        } catch (_) {}
+      }
+    }
+    if (rpc == null) return;
+
     // Ask the worker to close its RandomAccessFile before terminating it.
     // If the worker is already dead or unresponsive, dispose still kills it.
     try {
-      await _rpc.callWithTimeout<Object?>(
+      await rpc.callWithTimeout<Object?>(
         'close',
         timeout: const Duration(seconds: 3),
       );
     } catch (_) {
       // Disposal is best-effort; the host-side controller still terminates it.
     } finally {
-      await _rpc.dispose();
+      await rpc.dispose();
     }
   }
 }
@@ -376,12 +986,14 @@ class _ZipEntry {
     this.method,
     this.compressedSize,
     this.localHeaderOffset,
+    this.uncompressedSize,
   );
 
   final String name;
   final int method; // 0 = stored, 8 = deflate
   final int compressedSize;
   final int localHeaderOffset;
+  final int uncompressedSize;
 }
 
 void _zipWorkerMain(List<Object?> boot) {
@@ -399,6 +1011,9 @@ class _ZipWorker {
     switch (op) {
       case 'open':
         return _open(args as String);
+      case 'attach':
+        final List<dynamic> wire = args as List<dynamic>;
+        return _attach(wire[0] as String, wire.sublist(1));
       case 'read':
         return _read(args as int);
       case 'dims':
@@ -430,7 +1045,51 @@ class _ZipWorker {
     }
   }
 
-  int _open(String path) {
+  /// Opens the archive from an index cached by an earlier `open`: only the file
+  /// handle is created. The local headers of the first and last page are checked
+  /// so an index that no longer matches the bytes fails fast (the host then
+  /// falls back to a full `open`).
+  int _attach(String path, List<dynamic> wire) {
+    _close();
+    if (wire.length < 5) throw const FormatException('Invalid ZIP index');
+    final _ZipIndex? index = _ZipIndex.tryParse(
+      wire[0],
+      wire[1],
+      wire[2],
+      wire[3],
+      wire[4],
+    );
+    if (index == null) throw const FormatException('Invalid ZIP index');
+
+    final List<_ZipEntry> entries = index.toEntries();
+    final RandomAccessFile raf = File(path).openSync();
+    try {
+      _dataStart(raf, entries.first);
+      _dataStart(raf, entries.last);
+    } catch (_) {
+      try {
+        raf.closeSync();
+      } catch (_) {}
+      rethrow;
+    }
+    _raf = raf;
+    _entries = entries;
+    return entries.length;
+  }
+
+  List<Object?> _openReply() {
+    final _ZipIndex index = _ZipIndex.fromEntries(_entries);
+    return <Object?>[
+      _entries.length,
+      index.names,
+      index.offsets,
+      index.compressedSizes,
+      index.uncompressedSizes,
+      index.methods,
+    ];
+  }
+
+  Object _open(String path) {
     _close();
 
     final RandomAccessFile raf = File(path).openSync();
@@ -445,7 +1104,7 @@ class _ZipWorker {
           (_ZipEntry entry) => _normalizeArchiveEntryPath(entry.name),
         );
         retainedHandle = true;
-        return _entries.length;
+        return _openReply();
       }
     } finally {
       if (!retainedHandle) {
@@ -477,7 +1136,7 @@ class _ZipWorker {
       (ArchiveFile file) => _normalizeArchiveEntryPath(file.name),
     );
     _useFallback = true;
-    return _fallback.length;
+    return <Object?>[_fallback.length];
   }
 
   TransferableTypedData _read(int index) {
@@ -591,6 +1250,7 @@ List<_ZipEntry>? _readCentralDirectory(RandomAccessFile raf) {
     final int flags = _u16(centralDirectory, offset + 8);
     final int method = _u16(centralDirectory, offset + 10);
     final int compressedSize = _u32(centralDirectory, offset + 20);
+    final int uncompressedSize = _u32(centralDirectory, offset + 24);
     final int nameLength = _u16(centralDirectory, offset + 28);
     final int extraLength = _u16(centralDirectory, offset + 30);
     final int commentLength = _u16(centralDirectory, offset + 32);
@@ -626,7 +1286,9 @@ List<_ZipEntry>? _readCentralDirectory(RandomAccessFile raf) {
     }
 
     if (localOffset < 0 || localOffset + 30 > length) return null;
-    pages.add(_ZipEntry(name, method, compressedSize, localOffset));
+    pages.add(
+      _ZipEntry(name, method, compressedSize, localOffset, uncompressedSize),
+    );
   }
 
   if (entriesRead != totalEntries) return null;
@@ -663,19 +1325,88 @@ PageDimensions? _sniffEntry(RandomAccessFile raf, _ZipEntry entry) {
       raf.readSync(headLength),
     );
     if (quick != null || entry.compressedSize <= headLength) return quick;
+  } else if (entry.method == 8) {
+    // Image headers sit in the first bytes, so inflating the first 64 KB of the
+    // compressed stream (native zlib) is enough. Inflating the whole page just
+    // to read its size is what made cold probing of deflated archives slow.
+    try {
+      raf.setPositionSync(_dataStart(raf, entry));
+      final int headLength = math.min(entry.compressedSize, _sniffBytes);
+      final Uint8List? prefix = _inflatePrefix(raf.readSync(headLength));
+      if (prefix != null && prefix.isNotEmpty) {
+        final PageDimensions? quick = ImageHeaderSniffer.sniff(prefix);
+        if (quick != null) return quick;
+      }
+    } catch (_) {
+      // Fall through to the exact (full) path below.
+    }
   }
   return ImageHeaderSniffer.sniff(_readEntry(raf, entry));
+}
+
+/// Collects the output of a chunked zlib conversion.
+class _PrefixCollector implements Sink<List<int>> {
+  final BytesBuilder _bytes = BytesBuilder(copy: true);
+
+  @override
+  void add(List<int> data) => _bytes.add(data);
+
+  @override
+  void close() {}
+
+  Uint8List take() => _bytes.takeBytes();
+}
+
+/// Inflates as much of a truncated raw-deflate stream as its bytes allow.
+/// The stream is cut on purpose, so the "unexpected end of data" error that a
+/// complete decode would raise is ignored; whatever was produced is returned.
+Uint8List? _inflatePrefix(Uint8List compressed) {
+  final _PrefixCollector collector = _PrefixCollector();
+  final ByteConversionSink sink = io.ZLibDecoder(
+    raw: true,
+  ).startChunkedConversion(collector);
+  try {
+    sink.add(compressed);
+  } catch (_) {
+    // Truncated or damaged: keep what was produced before the error.
+  }
+  try {
+    sink.close(); // Releases the native zlib state; throws on truncated input.
+  } catch (_) {}
+  return collector.take();
 }
 
 // =============================================================================
 // CBR: pages are files on disk
 // =============================================================================
 
-class FilePageSource implements ComicPageSource {
+class FilePageSource implements ComicPageSource, PageDimensionProbe {
   FilePageSource(this.rootPath, this.relativePaths);
 
   final String rootPath;
   final List<String> relativePaths;
+
+  /// Cached folder path and the sorted relative page names (see [fromJson]).
+  Map<String, dynamic> toJson() => <String, dynamic>{
+    'type': 'cbr',
+    'root': rootPath,
+    'files': relativePaths,
+  };
+
+  /// Rebuilds a source from [toJson] output. The caller supplies the folder's
+  /// current path ([rootPath]); the stored one can go stale if the app's
+  /// temporary directory moves. Returns null for an invalid document.
+  static FilePageSource? fromJson(Object? json, String rootPath) {
+    if (json is! Map<String, dynamic> || json['type'] != 'cbr') return null;
+    final Object? files = json['files'];
+    if (files is! List || files.isEmpty) return null;
+    final List<String> names = <String>[];
+    for (final Object? name in files) {
+      if (name is! String || name.isEmpty) return null;
+      names.add(name);
+    }
+    return FilePageSource(rootPath, names);
+  }
 
   @override
   int get pageCount => relativePaths.length;
@@ -697,8 +1428,61 @@ class FilePageSource implements ComicPageSource {
     return _decodeDims(await _sniffFilesInIsolate(rootPath, relativePaths));
   }
 
+  /// Header-only reads on the I/O thread pool, one page at a time: no isolate
+  /// is spawned per micro-batch, and the event loop is free between reads.
+  @override
+  Future<List<PageDimensions?>> probeDimensions(int start, int count) async {
+    if (start < 0 || count < 0 || start + count > pageCount) {
+      throw RangeError('Invalid dimensions range: $start + $count of $pageCount');
+    }
+    final List<PageDimensions?> out = <PageDimensions?>[];
+    for (int i = start; i < start + count; i++) {
+      out.add(await _sniffFileAsync(relativePaths[i]));
+    }
+    return out;
+  }
+
+  Future<PageDimensions?> _sniffFileAsync(String relativePath) async {
+    final String relative = relativePath.replaceAll(
+      '/',
+      Platform.pathSeparator,
+    );
+    RandomAccessFile? raf;
+    try {
+      raf = await File('$rootPath${Platform.pathSeparator}$relative').open();
+      final int length = await raf.length();
+      final Uint8List head = await raf.read(math.min(length, _sniffBytes));
+      PageDimensions? dimensions = ImageHeaderSniffer.sniff(head);
+      if (dimensions == null && length > head.length) {
+        await raf.setPosition(0);
+        dimensions = ImageHeaderSniffer.sniff(await raf.read(length));
+      }
+      return dimensions;
+    } catch (_) {
+      return null; // The reader measures this page after loading it.
+    } finally {
+      try {
+        await raf?.close();
+      } catch (_) {}
+    }
+  }
+
   @override
   Future<void> dispose() async {}
+}
+
+/// Counts the page images below [root] (same filter as the extraction index).
+Future<int> _countPageFiles(String root) async {
+  int count = 0;
+  await for (final FileSystemEntity entity in Directory(
+    root,
+  ).list(recursive: true, followLinks: false)) {
+    if (entity is! File) continue;
+    String relative = entity.path.substring(root.length).replaceAll('\\', '/');
+    if (relative.startsWith('/')) relative = relative.substring(1);
+    if (_isPageImage(relative)) count++;
+  }
+  return count;
 }
 
 Future<List<String>> _listPagesInIsolate(String root) =>

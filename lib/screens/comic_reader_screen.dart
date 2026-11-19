@@ -11,8 +11,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import '../services/comic_cache_service.dart';
 import '../services/comic_identity.dart';
 import '../services/comic_page_source.dart';
+import '../services/comic_parser_service.dart' show PageDimensionProbe;
 import '../services/native_opencv_service.dart';
 import '../services/panel_detection_service.dart';
 import '../services/reading_progress_service.dart';
@@ -1022,6 +1024,11 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
         _initialVirtualPage = _findVirtualPageIndex(_currentPage);
       }
 
+      // Warm path: every page's size (and so the double-page layout) comes from
+      // the index cache - zero image-header I/O. A cold cache falls through to
+      // _loadRemainingLayoutData below.
+      final bool dimsFromCache = await _applyCachedDimensions();
+
       // Load the first page with safety fallback
       try {
         await _ensurePageLoaded(_currentPage).timeout(const Duration(seconds: 8));
@@ -1036,6 +1043,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       _attachPagerListener();
       setState(() {
         _isEngineReady = true; // Guarantees the loading screen dismisses
+        if (dimsFromCache) _layoutReady = true; // Spread mode usable at once
         if (_wantsBefore) {
           _fullPagePosition = FullPagePosition.beforeFirst;
         }
@@ -1048,7 +1056,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       _progressTrackingEnabled = true;
       _reportProgress();
 
-      unawaited(_loadRemainingLayoutData());
+      if (!dimsFromCache) unawaited(_loadRemainingLayoutData());
       _schedulePrefetch(_initialVirtualPage);
       await _finishProgressRestore(saved);
 
@@ -1291,20 +1299,191 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     unawaited(_warmWindow(ordered));
   }
 
-  // Measures every page from its header, in a background isolate, then builds
-  // the double-page layout (it needs every page's aspect ratio). Spread mode
-  // stays disabled until this has finished.
-  Future<void> _loadRemainingLayoutData() async {
+  // ---------------------------------------------------------------------------
+  // Page dimensions: index cache + throttled cold probing
+  // ---------------------------------------------------------------------------
+
+  // Cold-cache probing. The pages around the reading position are measured
+  // first (current spread, curl snapshots and the neighbours YOLOv8 works on
+  // never wait for a sweep); the rest follows in small batches with a pause in
+  // between, and a batch is held back (briefly) while a page turn, a pager
+  // scroll or a panel-detection job is running.
+  static const int _kDimsPriorityBefore = 2;
+  static const int _kDimsPriorityAfter = 6;
+  static const int _kDimsBatchPages = 8;
+  static const Duration _kDimsBatchYield = Duration(milliseconds: 32);
+  static const Duration _kDimsBusyPoll = Duration(milliseconds: 60);
+  static const int _kDimsMaxBusyPolls = 8; // At most ~480 ms of waiting per batch.
+
+  // Fills _imageSizesCache for EVERY page from the stored index and builds the
+  // double-page layout, all before the first frame. Returns false (leaving the
+  // caches untouched or partially filled) on a miss; the cold path then only
+  // probes what is still unknown.
+  Future<bool> _applyCachedDimensions() async {
+    final ComicIdentity? comic = widget.comic;
+    final int count = _pageCount;
+    if (comic == null || count <= 0) return false;
     try {
-      final List<PageDimensions?> dims = await widget.source
-          .readAllDimensions();
-      if (!mounted) return;
-      for (int i = 0; i < dims.length && i < _pageCount; i++) {
-        final PageDimensions? d = dims[i];
-        if (d != null && !_imageSizesCache.containsKey(i)) {
-          _imageSizesCache[i] = Size(d.width.toDouble(), d.height.toDouble());
+      final Map<String, dynamic>? index = await ComicCacheService.instance
+          .readIndexCache(comic.id);
+      final Object? raw = index?['dimensions'];
+      if (raw is! List || raw.length != count) return false;
+
+      int known = 0;
+      for (int i = 0; i < count; i++) {
+        final Object? pair = raw[i];
+        if (pair is! List || pair.length < 2) continue;
+        final Object? w = pair[0];
+        final Object? h = pair[1];
+        if (w is int && h is int && w > 0 && h > 0) {
+          _imageSizesCache[i] = Size(w.toDouble(), h.toDouble());
+          known++;
         }
       }
+      if (known != count) return false;
+
+      await _buildDoubleLayout();
+      return mounted;
+    } catch (e, st) {
+      debugPrint('Cached page dimensions unusable: $e\n$st');
+      return false;
+    }
+  }
+
+  // Stores every known page size next to the archive index, keyed by comic id.
+  // Unknown pages are stored as [0, 0] and measured again next time.
+  Future<void> _persistDimensionsToIndex() async {
+    final ComicIdentity? comic = widget.comic;
+    final int count = _pageCount;
+    if (comic == null || count <= 0) return;
+
+    final List<List<int>> dimensions = <List<int>>[];
+    for (int i = 0; i < count; i++) {
+      final Size? size = _imageSizesCache[i];
+      dimensions.add(
+        size == null
+            ? <int>[0, 0]
+            : <int>[size.width.round(), size.height.round()],
+      );
+    }
+    await ComicCacheService.instance.mergeIndexCache(
+      comic.id,
+      <String, dynamic>{'pageCount': count, 'dimensions': dimensions},
+    );
+  }
+
+  bool get _isPagerMoving {
+    try {
+      return _pageController.hasClients &&
+          _pageController.position.isScrollingNotifier.value;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Lets an active page turn / scroll / detection job finish before the next
+  // probe batch touches the disk. Bounded, so probing always makes progress.
+  Future<void> _waitForQuietMoment() async {
+    for (int i = 0; i < _kDimsMaxBusyPolls; i++) {
+      if (!mounted) return;
+      final bool busy =
+          _navBusy ||
+          _panelJobs.isNotEmpty ||
+          _animationController.isAnimating ||
+          _isPagerMoving;
+      if (!busy) return;
+      await Future<void>.delayed(_kDimsBusyPoll);
+    }
+  }
+
+  // Probes [start, start + count) unless every page in it is already known.
+  // Returns false once the screen is gone. A failed probe leaves its pages
+  // unknown; the slow per-page fallback in _loadRemainingLayoutData covers them.
+  Future<bool> _probeDimensionRange(
+    PageDimensionProbe probe,
+    int start,
+    int count, {
+    required bool throttle,
+  }) async {
+    if (!mounted) return false;
+    bool needed = false;
+    for (int i = start; i < start + count && !needed; i++) {
+      needed = !_imageSizesCache.containsKey(i);
+    }
+
+    if (needed) {
+      if (throttle) {
+        await _waitForQuietMoment();
+        if (!mounted) return false;
+      }
+      try {
+        final List<PageDimensions?> part = await probe.probeDimensions(
+          start,
+          count,
+        );
+        if (!mounted) return false;
+        for (int k = 0; k < part.length; k++) {
+          final int page = start + k;
+          final PageDimensions? d = part[k];
+          if (d != null && !_imageSizesCache.containsKey(page)) {
+            _imageSizesCache[page] = Size(
+              d.width.toDouble(),
+              d.height.toDouble(),
+            );
+          }
+        }
+      } catch (e, st) {
+        debugPrint('Dimension probe [$start, ${start + count}) failed: $e\n$st');
+      }
+    }
+
+    if (throttle) await Future<void>.delayed(_kDimsBatchYield);
+    return mounted;
+  }
+
+  // 1) the priority window around the reading position in one call, 2) the
+  // rest in micro-batches (forward to the last page, then backward to the
+  // first), each preceded by a quiet-moment check and followed by a yield.
+  Future<void> _probeAllDimensionsThrottled(PageDimensionProbe probe) async {
+    final int count = _pageCount;
+    final int lo = math.max(0, _currentPage - _kDimsPriorityBefore);
+    final int hi = math.min(count - 1, _currentPage + _kDimsPriorityAfter);
+
+    if (!await _probeDimensionRange(probe, lo, hi - lo + 1, throttle: false)) {
+      return;
+    }
+    for (int s = hi + 1; s < count; s += _kDimsBatchPages) {
+      final int n = math.min(_kDimsBatchPages, count - s);
+      if (!await _probeDimensionRange(probe, s, n, throttle: true)) return;
+    }
+    for (int e = lo; e > 0; e -= _kDimsBatchPages) {
+      final int s = math.max(0, e - _kDimsBatchPages);
+      if (!await _probeDimensionRange(probe, s, e - s, throttle: true)) return;
+    }
+  }
+
+  // Cold path: measures the pages that are still unknown (priority window
+  // first, then throttled batches), then builds the double-page layout (it
+  // needs every page's aspect ratio) and stores the sizes in the index cache.
+  // Spread mode stays disabled until this has finished.
+  Future<void> _loadRemainingLayoutData() async {
+    try {
+      final Object source = widget.source;
+      if (source is PageDimensionProbe) {
+        await _probeAllDimensionsThrottled(source);
+      } else {
+        // Sources without range probing (in-memory pages) keep the old sweep.
+        final List<PageDimensions?> dims = await widget.source
+            .readAllDimensions();
+        if (!mounted) return;
+        for (int i = 0; i < dims.length && i < _pageCount; i++) {
+          final PageDimensions? d = dims[i];
+          if (d != null && !_imageSizesCache.containsKey(i)) {
+            _imageSizesCache[i] = Size(d.width.toDouble(), d.height.toDouble());
+          }
+        }
+      }
+      if (!mounted) return;
 
       // Rare: a header the sniffer could not parse. Measure those the slow way.
       for (int i = 0; i < _pageCount; i++) {
@@ -1323,6 +1502,9 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       await _buildDoubleLayout();
       if (!mounted) return;
       setState(() => _layoutReady = true);
+
+      // Fire and forget: the next open of this comic skips all of the above.
+      unawaited(_persistDimensionsToIndex());
     } catch (e, st) {
       debugPrint('Error measuring pages: $e\n$st');
     }
@@ -2776,7 +2958,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
         // automatically turn off the page sound effect.
         if (mode == PageTransitionMode.swipe) {
           _pageSoundEnabled = false;
-          _pageTurnSound.setEnabled(false);
+          unawaited(_pageTurnSound.setEnabled(false));
         }
       });
       await WidgetsBinding.instance.endOfFrame;
@@ -3853,7 +4035,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
             _showPanelOverlays &&
             _fullPagePosition == FullPagePosition.none &&
             _currentPage != page)
-          Container(color: Colors.black.withValues(alpha: 0.65)),
+          Container(color: Colors.black.withValues(alpha: _dimmingLevel)),
       ],
     );
   }
