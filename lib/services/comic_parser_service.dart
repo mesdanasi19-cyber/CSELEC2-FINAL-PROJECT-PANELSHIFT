@@ -79,6 +79,13 @@ class ComicParserService {
 
   static int _cacheAttemptSequence = 0;
 
+  /// Returns a new list of [items] in natural filename order ("Issue 2" before
+  /// "Issue 10", case-insensitive), using the same comparison that orders an
+  /// archive's pages. Keys are built once per item, so it is cheap for the long
+  /// file lists produced by a folder import. [items] is not modified.
+  static List<T> sortNaturally<T>(List<T> items, String Function(T item) nameOf) =>
+      _sortNaturally<T>(items, nameOf);
+
   /// Opens a .cbz/.zip/.cbr/.rar file. The format is detected from its magic
   /// bytes, with the extension used only when the header is unrecognised.
   ///

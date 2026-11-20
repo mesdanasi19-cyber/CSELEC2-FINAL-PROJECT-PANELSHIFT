@@ -72,6 +72,32 @@ enum LibrarySort {
 
 enum _LibraryMenuAction { deleteRead }
 
+enum _ImportChoice { file, folder }
+
+/// One comic archive found by the Android folder scan. Only metadata: nothing
+/// is copied until the comic's turn comes in the import loop.
+class _FolderComicEntry {
+  const _FolderComicEntry({
+    required this.uri,
+    required this.fileName,
+    required this.path,
+    required this.size,
+  });
+
+  /// Child document URI (content://...), kept as the "original source" so
+  /// "Delete all read" can delete the external original later.
+  final String uri;
+
+  /// File-system-safe name used for the cache copy and imported_comics/.
+  final String fileName;
+
+  /// Path relative to the picked folder; natural-sorted to get import order.
+  final String path;
+
+  /// Byte size reported by the storage provider, or -1 when unknown.
+  final int size;
+}
+
 enum _FileDeleteOutcome { deleted, skippedExternal, protectedOrLocked }
 
 class ComicProcessorScreen extends StatefulWidget {
@@ -89,6 +115,10 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   static const String _sortKey = 'panelshift.librarySort.v1';
   static const String _originalSourcesKey = 'panelshift.originalSources.v1';
   static const MethodChannel _safChannel = MethodChannel('panelshift/saf_picker');
+
+  /// Folder import also picks up comics inside sub-folders (breadth-first, up
+  /// to 8 levels). Set to false to import only the picked folder's own files.
+  static const bool _folderImportScansSubfolders = true;
 
   /// Order in which [ComicLibraryService.loadLibrary] returns comics: `true`
   /// when the oldest import comes first (new imports are appended), `false`
@@ -143,6 +173,11 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   // Comics being deleted in bulk: hidden immediately, even if a registry
   // reload lands before their removal has finished.
   final Set<String> _removing = <String>{};
+
+  // Multi-select: ids of the comics ticked on the dashboard. Selection mode is
+  // simply "at least one id selected"; unticking the last one leaves it.
+  final Set<String> _selectedIds = <String>{};
+  bool get _isSelecting => _selectedIds.isNotEmpty;
 
   @override
   void initState() {
@@ -279,6 +314,8 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     setState(() {
       _library = library;
       _libraryLoaded = true;
+      // Comics that left the registry can no longer be selected.
+      _selectedIds.retainAll(<String>{for (final ComicIdentity c in library) c.id});
       _lowerTitles
         ..clear()
         ..addEntries(
@@ -914,6 +951,230 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Import choice (single file / whole folder)
+  // ---------------------------------------------------------------------------
+
+  Future<void> _showImportChoiceSheet() async {
+    if (_isProcessing) return;
+
+    final _ImportChoice? choice = await showModalBottomSheet<_ImportChoice>(
+      context: context,
+      showDragHandle: true,
+      builder: (BuildContext sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            ListTile(
+              leading: const Icon(Icons.insert_drive_file_outlined),
+              title: const Text('Import a comic'),
+              subtitle: const Text('Pick one .cbz, .zip, .cbr or .rar file'),
+              onTap: () => Navigator.pop(sheetContext, _ImportChoice.file),
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder_copy_outlined),
+              title: const Text('Import a folder'),
+              subtitle: const Text(
+                'Add every comic in a folder to the library',
+              ),
+              onTap: () => Navigator.pop(sheetContext, _ImportChoice.folder),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || choice == null) return;
+
+    switch (choice) {
+      case _ImportChoice.file:
+        unawaited(_pickAndProcessComic());
+      case _ImportChoice.folder:
+        unawaited(_pickAndImportFolder());
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Folder import
+  // ---------------------------------------------------------------------------
+
+  /// Lets the user pick a folder and imports every comic archive in it into the
+  /// library, in natural filename order, WITHOUT opening any of them.
+  ///
+  /// Memory / storage safety (low-RAM 32-bit phones):
+  ///  * Android lists the child documents first (metadata only, no copying).
+  ///  * Comics are then handled strictly one at a time: stream one document
+  ///    into cache/file_picker/, persist it into imported_comics/ (which deletes
+  ///    the cache copy), open it, build the cover, register it and close it
+  ///    again before the next one starts.
+  ///  * CBR archives are not kept extracted (retainCbrCache: false), so a
+  ///    folder of RAR files cannot fill the cache; they extract on first open.
+  Future<void> _pickAndImportFolder() {
+    return _runProcessing('Opening folder picker...', () async {
+      if (!Platform.isAndroid) {
+        _notify('Folder import is available on Android only.');
+        return;
+      }
+
+      final Map<String, dynamic>? picked =
+          await _safChannel.invokeMapMethod<String, dynamic>(
+        'pickComicFolder',
+        <String, Object?>{'recursive': _folderImportScansSubfolders},
+      );
+      if (picked == null) {
+        _notify('Folder selection cancelled.');
+        return;
+      }
+
+      final List<_FolderComicEntry> found = <_FolderComicEntry>[];
+      final List<Object?> rawFiles =
+          (picked['files'] as List<Object?>?) ?? const <Object?>[];
+      for (final Object? raw in rawFiles) {
+        if (raw is! Map<Object?, Object?>) continue;
+        final String? uri = raw['uri'] as String?;
+        final String? fileName = raw['fileName'] as String?;
+        if (uri == null || uri.isEmpty || fileName == null || fileName.isEmpty) {
+          continue;
+        }
+        final String ext = fileName.split('.').last.toLowerCase();
+        if (!_supportedExtensions.contains(ext)) continue;
+        found.add(
+          _FolderComicEntry(
+            uri: uri,
+            fileName: fileName,
+            path: (raw['path'] as String?) ?? fileName,
+            size: (raw['size'] as num?)?.toInt() ?? -1,
+          ),
+        );
+      }
+
+      if (found.isEmpty) {
+        _notify('No .cbz, .zip, .cbr or .rar files found in that folder.');
+        return;
+      }
+
+      // Natural order on the relative path: "Issue 2" before "Issue 10", and
+      // files stay grouped by sub-folder.
+      final List<_FolderComicEntry> entries = ComicParserService.sortNaturally(
+        found,
+        (_FolderComicEntry entry) => entry.path,
+      );
+      await _importFolderEntries(entries);
+    });
+  }
+
+  Future<void> _importFolderEntries(List<_FolderComicEntry> entries) async {
+    final int total = entries.length;
+    int imported = 0;
+    int failed = 0;
+
+    for (int i = 0; i < total; i++) {
+      if (!mounted) return;
+      setState(() => _busyMessage = 'Importing ${i + 1} of $total...');
+      // Let the banner repaint before the heavy work starts.
+      await Future<void>.delayed(Duration.zero);
+
+      if (await _importFolderEntry(entries[i])) {
+        imported++;
+      } else {
+        failed++;
+      }
+
+      // Short breather between comics: lets the GC and the cover/grid
+      // rendering catch up on slow 32-bit devices.
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+    }
+
+    if (!mounted) return;
+    final String comics = imported == 1 ? '1 comic' : '$imported comics';
+    _notify(
+      failed == 0
+          ? 'Imported $comics.'
+          : 'Imported $comics. $failed could not be imported.',
+    );
+  }
+
+  /// Imports one comic of a folder scan. Returns true when it is in the library.
+  /// Never throws; a bad archive must not stop the rest of the folder.
+  Future<bool> _importFolderEntry(_FolderComicEntry entry) async {
+    final String sep = Platform.pathSeparator;
+    final Directory libraryDir = await _managedLibraryDir();
+    final File managedTarget = File(
+      '${libraryDir.path}$sep${entry.fileName}',
+    );
+    // Remember whether this import creates the managed copy, so a broken
+    // archive's copy can be removed again without touching an older comic.
+    final bool targetExistedBefore = await managedTarget.exists();
+
+    String? tempPath;
+    String? persistentPath;
+    bool registered = false;
+    try {
+      if (targetExistedBefore &&
+          entry.size >= 0 &&
+          await managedTarget.length() == entry.size) {
+        // Already imported earlier (same name and byte size): skip the copy.
+        persistentPath = managedTarget.path;
+      } else {
+        tempPath = await _safChannel.invokeMethod<String>(
+          'copyDocumentToCache',
+          <String, Object?>{'uri': entry.uri, 'name': entry.fileName},
+        );
+        if (tempPath == null || tempPath.isEmpty) {
+          throw StateError('The document could not be copied.');
+        }
+        persistentPath = await _persistPickedFile(tempPath);
+        tempPath = null; // _persistPickedFile removed the cache copy.
+      }
+
+      final LoadedComic loaded = await ComicParserService.loadComic(
+        persistentPath,
+        retainCbrCache: false,
+      );
+      final ComicIdentity identity = loaded.identity;
+      try {
+        if (loaded.source.pageCount > 0) {
+          // Cover first, while the source is open (no-op if one already exists).
+          await ComicCoverService.instance.adopt(loaded);
+          await ComicLibraryService.addComic(identity);
+          registered = true;
+        }
+      } finally {
+        // Release this comic (and its CBR extraction) before the next one.
+        try {
+          await loaded.close();
+        } catch (e) {
+          debugPrint('PanelShift: closing "${entry.path}" failed: $e');
+        }
+      }
+
+      if (!registered) {
+        debugPrint('PanelShift: no image pages in "${entry.path}", skipped.');
+        if (!targetExistedBefore) {
+          await _deleteComicFile(persistentPath, deleteExternal: false);
+        }
+        return false;
+      }
+
+      await _saveOriginalSource(identity.id, entry.uri);
+      return true;
+    } catch (e) {
+      debugPrint('PanelShift: folder import failed for "${entry.path}": $e');
+      if (tempPath != null) {
+        try {
+          await File(tempPath).delete();
+        } catch (_) {}
+      }
+      if (!targetExistedBefore && !registered) {
+        // Fresh (possibly half-written) managed copy of a failed import.
+        try {
+          if (await managedTarget.exists()) await managedTarget.delete();
+        } catch (_) {}
+      }
+      return false;
+    }
+  }
+
   Future<void> _openLibraryComic(ComicIdentity comic) {
     return _runProcessing('Opening ${comic.title}...', () async {
       if (!await File(comic.sourcePath).exists()) {
@@ -974,37 +1235,297 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     }
   }
 
-  Future<void> _confirmRemove(ComicIdentity comic) async {
+  // ---------------------------------------------------------------------------
+  // Multi-select
+  // ---------------------------------------------------------------------------
+
+  void _onEntryTap(ComicIdentity comic) {
+    if (_isSelecting) {
+      _toggleSelected(comic);
+    } else {
+      unawaited(_openLibraryComic(comic));
+    }
+  }
+
+  /// Long-press starts selection mode (with this comic ticked); while already
+  /// selecting it toggles the comic like a tap does.
+  void _onEntryLongPress(ComicIdentity comic) {
+    if (!_isSelecting && _isProcessing) return;
+    unawaited(HapticFeedback.selectionClick());
+    _toggleSelected(comic);
+  }
+
+  void _toggleSelected(ComicIdentity comic) {
+    setState(() {
+      if (!_selectedIds.remove(comic.id)) _selectedIds.add(comic.id);
+    });
+  }
+
+  void _clearSelection() {
+    if (_selectedIds.isEmpty) return;
+    setState(_selectedIds.clear);
+  }
+
+  /// Ticks every comic that is currently listed (i.e. after the search filter).
+  void _selectAllVisible() {
+    setState(() {
+      _selectedIds.addAll(_visible.map((ComicIdentity c) => c.id));
+    });
+  }
+
+  /// The selected comics in display order (comics being deleted are skipped).
+  List<ComicIdentity> _selectedComics() => <ComicIdentity>[
+    for (final ComicIdentity comic in _sorted)
+      if (_selectedIds.contains(comic.id)) comic,
+  ];
+
+  /// Batch "Remove from library": registry entry, cover, cached index and
+  /// PanelShift's internal copy go; external originals and reading progress
+  /// stay (same as the old single-comic remove).
+  Future<void> _confirmRemoveSelected() async {
     if (_isProcessing) return;
+    final List<ComicIdentity> comics = _selectedComics();
+    if (comics.isEmpty) return;
+    final int count = comics.length;
+
+    final String subject = count == 1
+        ? '"${comics.first.title}" and PanelShift\'s internal copy'
+        : 'The $count selected comics and PanelShift\'s internal copies';
 
     final bool? confirmed = await showDialog<bool>(
-    context: context,
-    builder: (BuildContext dialogContext) => AlertDialog(
-      title: const Text('Remove from library?'),
-      content: Text(
-        '"${comic.title}" and PanelShift\'s internal copy will be removed. '
-            'Any original file in your external folders is not deleted, and '
-            'your reading position is kept.',
+      context: context,
+      builder: (BuildContext dialogContext) => AlertDialog(
+        title: Text(
+          count == 1
+              ? 'Remove 1 comic from library?'
+              : 'Remove $count comics from library?',
+        ),
+        content: Text(
+          '$subject will be removed. Any original files in your external '
+          'folders are not deleted, and your reading positions are kept.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Remove'),
+          ),
+        ],
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(dialogContext, false),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(dialogContext, true),
-          child: const Text('Remove'),
-        ),
-      ],
-    ),
     );
-    if (confirmed != true) return;
+    if (confirmed != true || !mounted) return;
 
-    _preIndexQueue.removeWhere((ComicIdentity c) => c.id == comic.id);
-    await ComicLibraryService.removeComic(comic.id);
-    await ComicCoverService.instance.delete(comic.id);
-    await ComicCacheService.instance.deleteIndexCache(comic.id);
-    await _deleteComicFile(comic.sourcePath, deleteExternal: false);
+    final Set<String> ids = <String>{for (final ComicIdentity c in comics) c.id};
+    setState(() {
+      _isProcessing = true;
+      _busyMessage = count == 1 ? 'Removing 1 comic...' : 'Removing $count comics...';
+      _removing.addAll(ids);
+      _selectedIds.removeAll(ids);
+      _resort();
+    });
+
+    int failed = 0;
+    try {
+      // Sequential on purpose: registry removals are read-modify-write.
+      for (final ComicIdentity comic in comics) {
+        try {
+          _preIndexQueue.removeWhere((ComicIdentity c) => c.id == comic.id);
+          await ComicLibraryService.removeComic(comic.id);
+          await ComicCoverService.instance.delete(comic.id);
+          await ComicCacheService.instance.deleteIndexCache(comic.id);
+          await _deleteComicFile(comic.sourcePath, deleteExternal: false);
+        } catch (e) {
+          failed++;
+          debugPrint('PanelShift: could not remove ${comic.title}: $e');
+        }
+      }
+      try {
+        await ComicCacheService.instance.purgeOrphans();
+      } catch (e) {
+        debugPrint('PanelShift: cache cleanup failed: $e');
+      }
+    } finally {
+      try {
+        await _loadLibrary();
+      } catch (e) {
+        debugPrint('PanelShift: library reload failed: $e');
+      }
+      if (mounted) {
+        setState(() {
+          _removing.clear();
+          _resort();
+          _isProcessing = false;
+          _busyMessage = null;
+        });
+      }
+    }
+
+    final int removed = count - failed;
+    if (failed > 0) {
+      _notify('Removed $removed, but $failed could not be fully removed.');
+    } else {
+      _notify(
+        removed == 1
+            ? 'Removed 1 comic from the library.'
+            : 'Removed $removed comics from the library.',
+      );
+    }
+  }
+
+  /// Batch "Delete": wipes the selection through [_deleteComics]. When the
+  /// selection mixes finished and unfinished comics the dialog also offers to
+  /// delete only the finished ones.
+  Future<void> _confirmDeleteSelected() async {
+    if (_isProcessing) return;
+    final List<ComicIdentity> selected = _selectedComics();
+    if (selected.isEmpty) return;
+
+    setState(() {
+      _isProcessing = true;
+      _busyMessage = 'Checking selected comics...';
+    });
+
+    List<ComicIdentity> finished = const <ComicIdentity>[];
+    try {
+      finished = await _findFinishedComics(among: selected);
+    } catch (e) {
+      // Without the scan the "only finished" option is simply not offered.
+      debugPrint('PanelShift: finished-comic scan failed: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+          _busyMessage = null;
+        });
+      }
+    }
+    if (!mounted) return;
+
+    final bool canLimitToFinished =
+        finished.isNotEmpty && finished.length < selected.length;
+    bool deleteExternalFiles = false;
+    bool onlyFinished = false;
+
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        final ColorScheme scheme = Theme.of(dialogContext).colorScheme;
+        return StatefulBuilder(
+          builder: (BuildContext context, StateSetter setDialogState) {
+            final List<ComicIdentity> target = onlyFinished ? finished : selected;
+            final int count = target.length;
+            final List<String> preview = target
+                .take(5)
+                .map((ComicIdentity c) => c.title)
+                .toList(growable: false);
+
+            return AlertDialog(
+              icon: Icon(Icons.delete_outline, color: scheme.error),
+              title: Text(
+                count == 1
+                    ? (onlyFinished ? 'Delete 1 read comic?' : 'Delete 1 comic?')
+                    : (onlyFinished
+                          ? 'Delete $count read comics?'
+                          : 'Delete $count comics?'),
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      deleteExternalFiles
+                          ? 'The comics, PanelShift\'s internal data, AND '
+                                'original external comic files (where permitted '
+                                'by your OS) will be permanently deleted. This '
+                                'cannot be undone.'
+                          : 'The comics will be completely wiped from '
+                                'PanelShift (library entry, internal copy, '
+                                'reading progress, covers, and cached data). '
+                                'Original external files in folders like '
+                                'Downloads will not be touched.',
+                    ),
+                    const SizedBox(height: 12),
+                    for (final String title in preview)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        child: Text(
+                          '• $title',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    if (count > preview.length)
+                      Text('...and ${count - preview.length} more'),
+                    const SizedBox(height: 8),
+                    if (canLimitToFinished)
+                      CheckboxListTile(
+                        contentPadding: EdgeInsets.zero,
+                        controlAffinity: ListTileControlAffinity.leading,
+                        dense: true,
+                        value: onlyFinished,
+                        title: Text(
+                          finished.length == 1
+                              ? 'Only delete the 1 finished comic in this selection'
+                              : 'Only delete the ${finished.length} finished '
+                                    'comics in this selection',
+                        ),
+                        onChanged: (bool? checked) {
+                          setDialogState(() {
+                            onlyFinished = checked ?? false;
+                          });
+                        },
+                      ),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      dense: true,
+                      value: deleteExternalFiles,
+                      title: const Text(
+                        'Also delete original external files (when permitted)',
+                      ),
+                      onChanged: (bool? checked) {
+                        setDialogState(() {
+                          deleteExternalFiles = checked ?? false;
+                        });
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: scheme.error,
+                    foregroundColor: scheme.onError,
+                  ),
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: const Text('Delete'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    if (confirmed != true || !mounted) return;
+
+    final List<ComicIdentity> target = onlyFinished ? finished : selected;
+    setState(() {
+      _selectedIds.removeAll(target.map((ComicIdentity c) => c.id));
+    });
+    await _deleteComics(
+      target,
+      deleteExternalFiles: deleteExternalFiles,
+      onlyRead: onlyFinished,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1013,11 +1534,15 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
 
   /// Comics that show the "Finished" badge: their saved position is on the
   /// last page. Comics that were never opened (no saved progress) are skipped.
-  Future<List<ComicIdentity>> _findFinishedComics() async {
+  ///
+  /// Scans the whole library, or only [among] when given (the selection).
+  Future<List<ComicIdentity>> _findFinishedComics({
+    Iterable<ComicIdentity>? among,
+  }) async {
     final ComicCoverService covers = ComicCoverService.instance;
     final List<ComicIdentity> finished = <ComicIdentity>[];
 
-    for (final ComicIdentity comic in List<ComicIdentity>.of(_library)) {
+    for (final ComicIdentity comic in List<ComicIdentity>.of(among ?? _library)) {
       final ReadingProgress? progress = await ReadingProgressService.load(
         comic.id,
       );
@@ -1168,15 +1693,21 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   /// Removes every comic in [comics] from the registry, the cover store, the
   /// reading-progress store, and PanelShift's internal file storage, then
   /// sweeps the extraction cache.
+  ///
+  /// [onlyRead] only changes the wording of the messages ("read comics" vs.
+  /// plain "comics" for an arbitrary selection).
   Future<void> _deleteComics(
       List<ComicIdentity> comics, {
         required bool deleteExternalFiles,
+        bool onlyRead = true,
       }) async {
+    final String noun = onlyRead ? 'read comic' : 'comic';
+    final String nouns = onlyRead ? 'read comics' : 'comics';
     setState(() {
       _isProcessing = true;
       _busyMessage = comics.length == 1
-          ? 'Deleting 1 read comic...'
-          : 'Deleting ${comics.length} read comics...';
+          ? 'Deleting 1 $noun...'
+          : 'Deleting ${comics.length} $nouns...';
       _removing.addAll(comics.map((ComicIdentity c) => c.id));
       _resort();
     });
@@ -1224,12 +1755,12 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
       _notify('Deleted $deleted, but $failed could not be fully removed.');
     } else if (protectedFiles > 0) {
       _notify(
-        'Deleted $deleted read comic(s) ($protectedFiles external file(s) '
+        'Deleted $deleted $noun(s) ($protectedFiles external file(s) '
             'protected by OS).',
       );
     } else {
       _notify(
-        deleted == 1 ? 'Deleted 1 read comic.' : 'Deleted $deleted read comics.',
+        deleted == 1 ? 'Deleted 1 $noun.' : 'Deleted $deleted $nouns.',
       );
     }
   }
@@ -1283,11 +1814,17 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
 
   @override
   Widget build(BuildContext context) {
-    // Back closes the search bar first instead of leaving the app.
+    // Back clears the selection first, then closes the search bar, and only
+    // then leaves the app.
     return PopScope(
-      canPop: !_isSearching,
+      canPop: !_isSelecting && !_isSearching,
       onPopInvokedWithResult: (bool didPop, Object? result) {
-        if (!didPop && _isSearching) _closeSearch();
+        if (didPop) return;
+        if (_isSelecting) {
+          _clearSelection();
+        } else if (_isSearching) {
+          _closeSearch();
+        }
       },
       child: _buildScaffold(context),
     );
@@ -1298,7 +1835,9 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     final ColorScheme scheme = Theme.of(context).colorScheme;
 
     return Scaffold(
-      appBar: AppBar(
+      appBar: _isSelecting
+          ? _buildSelectionAppBar(context)
+          : AppBar(
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         title: Text(widget.title),
         actions: [
@@ -1363,11 +1902,13 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
           ),
         ],
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _isProcessing ? null : _pickAndProcessComic,
-        icon: const Icon(Icons.folder_open),
-        label: const Text('Import comic'),
-      ),
+      floatingActionButton: _isSelecting
+          ? null
+          : FloatingActionButton.extended(
+              onPressed: _isProcessing ? null : _showImportChoiceSheet,
+              icon: const Icon(Icons.library_add_outlined),
+              label: const Text('Import'),
+            ),
       body: Column(
         children: [
           if (_isProcessing) _buildBusyBanner(),
@@ -1375,6 +1916,46 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
           Expanded(child: _buildLibrary()),
         ],
       ),
+    );
+  }
+
+  /// Contextual bar shown while comics are selected.
+  PreferredSizeWidget _buildSelectionAppBar(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final bool allVisibleSelected =
+        _visible.isNotEmpty &&
+        _visible.every((ComicIdentity c) => _selectedIds.contains(c.id));
+
+    return AppBar(
+      backgroundColor: scheme.secondaryContainer,
+      foregroundColor: scheme.onSecondaryContainer,
+      leading: IconButton(
+        tooltip: 'Clear selection',
+        icon: const Icon(Icons.close),
+        onPressed: _clearSelection,
+      ),
+      title: Text('${_selectedIds.length} selected'),
+      actions: [
+        IconButton(
+          tooltip: 'Select all',
+          icon: const Icon(Icons.select_all),
+          onPressed: allVisibleSelected ? null : _selectAllVisible,
+        ),
+        IconButton(
+          tooltip: 'Remove from library',
+          icon: const Icon(Icons.remove_circle_outline),
+          onPressed: _isProcessing
+              ? null
+              : () => unawaited(_confirmRemoveSelected()),
+        ),
+        IconButton(
+          tooltip: 'Delete',
+          icon: const Icon(Icons.delete_outline),
+          onPressed: _isProcessing
+              ? null
+              : () => unawaited(_confirmDeleteSelected()),
+        ),
+      ],
     );
   }
 
@@ -1550,8 +2131,10 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
                 comic: comic,
                 layout: _EntryLayout.grid,
                 bookshelf: shelf,
-                onTap: () => _openLibraryComic(comic),
-                onLongPress: () => _confirmRemove(comic),
+                isSelected: _selectedIds.contains(comic.id),
+                isSelectionMode: _isSelecting,
+                onTap: () => _onEntryTap(comic),
+                onLongPress: () => _onEntryLongPress(comic),
               );
             },
           ),
@@ -1589,8 +2172,10 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
                 comic: comic,
                 layout: _EntryLayout.list,
                 bookshelf: shelf,
-                onTap: () => _openLibraryComic(comic),
-                onLongPress: () => _confirmRemove(comic),
+                isSelected: _selectedIds.contains(comic.id),
+                isSelectionMode: _isSelecting,
+                onTap: () => _onEntryTap(comic),
+                onLongPress: () => _onEntryLongPress(comic),
               );
             },
           ),
@@ -1702,6 +2287,8 @@ class _ComicEntry extends StatefulWidget {
     required this.onTap,
     required this.onLongPress,
     this.bookshelf = false,
+    this.isSelected = false,
+    this.isSelectionMode = false,
   });
 
   final ComicIdentity comic;
@@ -1710,6 +2297,12 @@ class _ComicEntry extends StatefulWidget {
   final VoidCallback onTap;
   final VoidCallback onLongPress;
 
+  /// This comic is ticked in multi-select mode.
+  final bool isSelected;
+
+  /// The dashboard is in multi-select mode (some comic is ticked).
+  final bool isSelectionMode;
+
   @override
   State<_ComicEntry> createState() => _ComicEntryState();
 }
@@ -1717,6 +2310,16 @@ class _ComicEntry extends StatefulWidget {
 class _ComicEntryState extends State<_ComicEntry> {
   late final Future<ComicCover?> _coverFuture;
   late final ComicCover? _initialCover;
+
+  /// Luminance-weighted grayscale applied to finished covers. A colour matrix
+  /// runs on the GPU over the already-decoded bitmap, so it costs no extra
+  /// decode and no extra image cache entry.
+  static const ColorFilter _grayscaleFilter = ColorFilter.matrix(<double>[
+    0.2126, 0.7152, 0.0722, 0, 0,
+    0.2126, 0.7152, 0.0722, 0, 0,
+    0.2126, 0.7152, 0.0722, 0, 0,
+    0, 0, 0, 1, 0,
+  ]);
 
   ReadingProgress? _progress;
   bool _progressLoaded = false;
@@ -1822,6 +2425,7 @@ class _ComicEntryState extends State<_ComicEntry> {
           context,
           cover,
           loading: snapshot.connectionState != ConnectionState.done,
+          finished: summary?.finished ?? false,
         );
 
         if (widget.bookshelf) {
@@ -1859,6 +2463,7 @@ class _ComicEntryState extends State<_ComicEntry> {
     BuildContext context,
     ComicCover? cover, {
     required bool loading,
+    bool finished = false,
   }) {
     final ColorScheme scheme = Theme.of(context).colorScheme;
 
@@ -1870,7 +2475,7 @@ class _ComicEntryState extends State<_ComicEntry> {
     if (cover != null) {
       return LayoutBuilder(
         builder: (BuildContext context, BoxConstraints constraints) {
-          return Image.file(
+          final Widget image = Image.file(
             File(cover.path),
             fit: BoxFit.cover,
             alignment: Alignment.topCenter,
@@ -1892,6 +2497,10 @@ class _ComicEntryState extends State<_ComicEntry> {
               Icon(Icons.broken_image_outlined, color: scheme.onSurfaceVariant),
             ),
           );
+          // Finished comics are shown in black and white.
+          return finished
+              ? ColorFiltered(colorFilter: _grayscaleFilter, child: image)
+              : image;
         },
       );
     }
@@ -1915,29 +2524,96 @@ class _ComicEntryState extends State<_ComicEntry> {
     );
   }
 
+  /// Only flags a missing source file. The top-right check mark belongs to
+  /// the selection indicator (see [_selectionMarks]); finished comics are
+  /// shown with a black-and-white cover instead. In selection mode the badge
+  /// moves to the top-left so it never sits under the indicator.
   Widget _statusBadge(ColorScheme scheme, _ProgressSummary? summary) {
-    final bool finished = summary?.finished ?? false;
-    if (!finished && !_sourceMissing) return const SizedBox.shrink();
+    if (!_sourceMissing) return const SizedBox.shrink();
 
     return Positioned(
       top: 6,
-      right: 6,
+      left: widget.isSelectionMode ? 6 : null,
+      right: widget.isSelectionMode ? null : 6,
       child: DecoratedBox(
         decoration: BoxDecoration(
-          color: _sourceMissing ? scheme.errorContainer : scheme.primary,
+          color: scheme.errorContainer,
           shape: BoxShape.circle,
         ),
         child: Padding(
           padding: const EdgeInsets.all(4),
           child: Icon(
-            _sourceMissing ? Icons.link_off : Icons.check,
+            Icons.link_off,
             size: 14,
-            color: _sourceMissing ? scheme.onErrorContainer : scheme.onPrimary,
+            color: scheme.onErrorContainer,
           ),
         ),
       ),
     );
   }
+
+  /// Selection overlay for the cover stack: an empty circle on every comic
+  /// while in selection mode, and on the selected ones a filled check badge
+  /// (top right), a light tint and, with [outline], a border. Pass
+  /// `outline: false` where the surrounding [Card] draws the border itself.
+  Widget _selectionMarks(ColorScheme scheme, {bool outline = true}) {
+    if (!widget.isSelectionMode) return const SizedBox.shrink();
+    final bool selected = widget.isSelected;
+
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (selected)
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: scheme.primary.withAlpha(46),
+                  border: outline
+                      ? Border.all(color: scheme.primary, width: 3)
+                      : null,
+                ),
+              ),
+            Positioned(
+              top: 6,
+              right: 6,
+              child: SizedBox(
+                width: 24,
+                height: 24,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: selected ? scheme.primary : Colors.black38,
+                    border: Border.all(
+                      color: selected ? scheme.onPrimary : Colors.white,
+                      width: 2,
+                    ),
+                  ),
+                  child: selected
+                      ? Center(
+                          child: Icon(
+                            Icons.check,
+                            size: 14,
+                            color: scheme.onPrimary,
+                          ),
+                        )
+                      : null,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Card outline for the normal (non-bookshelf) layouts.
+  ShapeBorder _cardShape(ColorScheme scheme) => RoundedRectangleBorder(
+    borderRadius: BorderRadius.circular(12),
+    side: widget.isSelected
+        ? BorderSide(color: scheme.primary, width: 2)
+        : BorderSide.none,
+  );
 
   // --- bookshelf layouts ------------------------------------------------------
 
@@ -1979,6 +2655,7 @@ class _ComicEntryState extends State<_ComicEntry> {
                 cover,
                 if (fraction != null) _shelfProgressBar(fraction),
                 _statusBadge(theme.colorScheme, summary),
+                _selectionMarks(theme.colorScheme),
               ],
             ),
           ),
@@ -2015,7 +2692,11 @@ class _ComicEntryState extends State<_ComicEntry> {
                   onLongPress: widget.onLongPress,
                   child: Stack(
                     fit: StackFit.expand,
-                    children: [cover, _statusBadge(theme.colorScheme, summary)],
+                    children: [
+                      cover,
+                      _statusBadge(theme.colorScheme, summary),
+                      _selectionMarks(theme.colorScheme),
+                    ],
                   ),
                 ),
               ),
@@ -2087,6 +2768,7 @@ class _ComicEntryState extends State<_ComicEntry> {
     return Card(
       margin: EdgeInsets.zero,
       clipBehavior: Clip.antiAlias,
+      shape: _cardShape(theme.colorScheme),
       child: InkWell(
         onTap: widget.onTap,
         onLongPress: widget.onLongPress,
@@ -2110,6 +2792,7 @@ class _ComicEntryState extends State<_ComicEntry> {
                       ),
                     ),
                   _statusBadge(theme.colorScheme, summary),
+                  _selectionMarks(theme.colorScheme, outline: false),
                 ],
               ),
             ),
@@ -2159,6 +2842,7 @@ class _ComicEntryState extends State<_ComicEntry> {
       child: Card(
         margin: EdgeInsets.zero,
         clipBehavior: Clip.antiAlias,
+        shape: _cardShape(theme.colorScheme),
         child: InkWell(
           onTap: widget.onTap,
           onLongPress: widget.onLongPress,
@@ -2169,7 +2853,11 @@ class _ComicEntryState extends State<_ComicEntry> {
                 width: 68,
                 child: Stack(
                   fit: StackFit.expand,
-                  children: [cover, _statusBadge(theme.colorScheme, summary)],
+                  children: [
+                    cover,
+                    _statusBadge(theme.colorScheme, summary),
+                    _selectionMarks(theme.colorScheme, outline: false),
+                  ],
                 ),
               ),
               Expanded(

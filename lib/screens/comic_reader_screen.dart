@@ -537,6 +537,14 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   bool _doubleLayoutIsManga = false;
   final Map<int, _RtlPanelOrder> _rtlPanelOrder = <int, _RtlPanelOrder>{};
 
+  // Reader controls that stay the same across comics and app restarts. Same
+  // scheme as the manga preference: loaded in _bootstrap (before the first
+  // build) and saved on every change. A missing or unrecognised value falls
+  // back to the default.
+  static const String _kScreenLockPrefKey = 'reader_screen_locked';
+  static const String _kFullPageStepModePrefKey = 'reader_full_page_step_mode';
+  static const String _kPageTurnSpeedPrefKey = 'reader_page_turn_speed';
+
   // Reading transition: the custom page curl or a plain horizontal slide.
   PageTransitionMode _transitionMode = PageTransitionMode.curl;
   bool get _useCurl => _transitionMode == PageTransitionMode.curl;
@@ -623,7 +631,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   FullPageStepMode _fullPageStepMode = FullPageStepMode.none;
   FullPagePosition _fullPagePosition = FullPagePosition.none;
 
-  bool _isScreenLocked = true;
+  bool _isScreenLocked = false;
   Size? _lastViewportSize;
 
   bool get _wantsBefore =>
@@ -705,6 +713,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
                       selected: option == _pageTurnSpeed,
                       onSelected: (_) {
                         setState(() => _pageTurnSpeed = option);
+                        unawaited(_persistPageTurnSpeed(option));
                         Navigator.of(dialogContext).pop();
                       },
                     ),
@@ -1003,11 +1012,81 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
     }
   }
 
+  // Reads the persisted Screen Lock, Show Fullscreen (full-page step) and
+  // page-turn speed. Each value is validated on its own: a missing, wrongly
+  // typed or unrecognised entry (or a storage error) keeps the default.
+  Future<void> _loadReaderControlPrefs() async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+
+      final Object? rawLock = prefs.get(_kScreenLockPrefKey);
+      final bool locked = rawLock is bool ? rawLock : false;
+
+      final Object? rawStep = prefs.get(_kFullPageStepModePrefKey);
+      final FullPageStepMode stepMode = rawStep is String
+          ? (FullPageStepMode.values.asNameMap()[rawStep] ??
+                FullPageStepMode.none)
+          : FullPageStepMode.none;
+
+      final Object? rawSpeed = prefs.get(_kPageTurnSpeedPrefKey);
+      final double speed =
+          rawSpeed is num && _pageTurnSpeedOptions.contains(rawSpeed.toDouble())
+          ? rawSpeed.toDouble()
+          : 1.0;
+
+      _isScreenLocked = locked;
+      _fullPageStepMode = stepMode;
+      _pageTurnSpeed = speed;
+    } catch (e, st) {
+      debugPrint('Reader control prefs load failed: $e\n$st');
+    }
+  }
+
+  Future<void> _persistScreenLock(bool value) async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kScreenLockPrefKey, value);
+    } catch (e, st) {
+      debugPrint('Screen lock save failed: $e\n$st');
+    }
+  }
+
+  Future<void> _persistFullPageStepMode(FullPageStepMode value) async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kFullPageStepModePrefKey, value.name);
+    } catch (e, st) {
+      debugPrint('Full-page step mode save failed: $e\n$st');
+    }
+  }
+
+  Future<void> _persistPageTurnSpeed(double value) async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_kPageTurnSpeedPrefKey, value);
+    } catch (e, st) {
+      debugPrint('Page-turn speed save failed: $e\n$st');
+    }
+  }
+
+  void _toggleScreenLock() {
+    final bool next = !_isScreenLocked;
+    setState(() => _isScreenLocked = next);
+    unawaited(_persistScreenLock(next));
+  }
+
   Future<void> _bootstrap() async {
     try {
       // The direction must be known before any layout is built or the pager is
       // shown (_isEngineReady is still false here).
       await _loadMangaMode();
+      // Same rule for the persisted lock / full-page step / speed. The lock has
+      // no separate side effect to apply: _pagerPhysics reads _isScreenLocked,
+      // so the first build of the pager already matches the Lock button, and
+      // the HUD (with the Lock button) is outside the pager, so it can always
+      // unlock. The speed feeds _slideDuration / _slideGuard, which both the
+      // curl and the swipe pager use.
+      await _loadReaderControlPrefs();
 
       unawaited(NativeOpenCvService.initializeEngine().catchError((Object e, StackTrace st) {
         debugPrint('YOLO engine init failed: $e\n$st');
@@ -1044,7 +1123,9 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
       setState(() {
         _isEngineReady = true; // Guarantees the loading screen dismisses
         if (dimsFromCache) _layoutReady = true; // Spread mode usable at once
-        if (_wantsBefore) {
+        // Open on the full-page view only at the start of a page. A saved
+        // mid-page position keeps its panel (see _finishProgressRestore).
+        if (_wantsBefore && _currentPanelIndex == 0) {
           _fullPagePosition = FullPagePosition.beforeFirst;
         }
       });
@@ -3684,7 +3765,7 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
                 ? 'Screen locked (swiping disabled)'
                 : 'Screen unlocked (swiping enabled)',
             active: _isScreenLocked,
-            onPressed: () => setState(() => _isScreenLocked = !_isScreenLocked),
+            onPressed: _toggleScreenLock,
           ),
         ),
         Expanded(
@@ -3819,14 +3900,14 @@ class _ComicReaderScreenState extends State<ComicReaderScreen>
   }
 
   void _cycleFullPageStepMode() {
-    setState(() {
-      _fullPageStepMode = switch (_fullPageStepMode) {
-        FullPageStepMode.none => FullPageStepMode.afterLast,
-        FullPageStepMode.afterLast => FullPageStepMode.beforeFirst,
-        FullPageStepMode.beforeFirst => FullPageStepMode.both,
-        FullPageStepMode.both => FullPageStepMode.none,
-      };
-    });
+    final FullPageStepMode next = switch (_fullPageStepMode) {
+      FullPageStepMode.none => FullPageStepMode.afterLast,
+      FullPageStepMode.afterLast => FullPageStepMode.beforeFirst,
+      FullPageStepMode.beforeFirst => FullPageStepMode.both,
+      FullPageStepMode.both => FullPageStepMode.none,
+    };
+    setState(() => _fullPageStepMode = next);
+    unawaited(_persistFullPageStepMode(next));
   }
 
   // Content for a layout-relative PageView item. The regular item is wrapped
