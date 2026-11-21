@@ -17,7 +17,7 @@ import 'services/comic_parser_service.dart';
 import 'services/reading_progress_service.dart';
 import 'screens/comic_reader_screen.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // Orphan cleanup is pure disk I/O. Started before the first frame it competes
   // with the library's cover reads on slow flash storage, so it waits until the
@@ -29,33 +29,213 @@ void main() {
           debugPrint('PanelShift cache cleanup failed: $error');
         }),
   );
-  runApp(const PanelShiftApp());
+  // The saved theme is read before the first frame so the app never flashes
+  // the default colors first. SharedPreferences is a single small file.
+  final AppThemeSettings theme = await AppThemeController.loadSaved();
+  runApp(PanelShiftApp(initialTheme: theme));
 }
 
-class PanelShiftApp extends StatelessWidget {
-  const PanelShiftApp({super.key});
+/// ==========================================
+/// 0. App theme (seed color + brightness)
+/// ==========================================
+
+/// One selectable seed color. [monochrome] renders the whole Material scheme in
+/// neutral greys (used by "Monochrome Slate").
+@immutable
+class AppThemePreset {
+  const AppThemePreset(this.name, this.argb, {this.monochrome = false});
+
+  final String name;
+
+  /// 0xAARRGGBB. This int is what gets persisted.
+  final int argb;
+  final bool monochrome;
+
+  Color get color => Color(argb);
+}
+
+class AppThemePresets {
+  const AppThemePresets._();
+
+  static const AppThemePreset deepPurple = AppThemePreset(
+    'Deep Purple',
+    0xFF673AB7,
+  );
+  static const AppThemePreset crimson = AppThemePreset('Crimson', 0xFFC62828);
+  static const AppThemePreset cobalt = AppThemePreset(
+    'Cobalt Blue',
+    0xFF0047AB,
+  );
+  static const AppThemePreset emerald = AppThemePreset('Emerald', 0xFF2E9E6B);
+  static const AppThemePreset amber = AppThemePreset('Amber', 0xFFFFB300);
+  static const AppThemePreset rose = AppThemePreset('Rose', 0xFFF06292);
+  static const AppThemePreset slate = AppThemePreset(
+    'Monochrome Slate',
+    0xFF607D8B,
+    monochrome: true,
+  );
+
+  static const List<AppThemePreset> all = <AppThemePreset>[
+    deepPurple,
+    crimson,
+    cobalt,
+    emerald,
+    amber,
+    rose,
+    slate,
+  ];
+
+  /// The preset saved as [argb], or Deep Purple for anything unknown.
+  static AppThemePreset byArgb(int? argb) {
+    for (final AppThemePreset preset in all) {
+      if (preset.argb == argb) return preset;
+    }
+    return deepPurple;
+  }
+}
+
+/// Immutable theme choice: seed color + dark/light.
+@immutable
+class AppThemeSettings {
+  const AppThemeSettings({required this.preset, required this.brightness});
+
+  static const AppThemeSettings defaults = AppThemeSettings(
+    preset: AppThemePresets.deepPurple,
+    brightness: Brightness.dark,
+  );
+
+  final AppThemePreset preset;
+  final Brightness brightness;
+
+  ThemeData toThemeData() {
+    final ColorScheme scheme = ColorScheme.fromSeed(
+      seedColor: preset.color,
+      brightness: brightness,
+      dynamicSchemeVariant: preset.monochrome
+          ? DynamicSchemeVariant.monochrome
+          : DynamicSchemeVariant.tonalSpot,
+    );
+    return ThemeData(
+      colorScheme: scheme,
+      useMaterial3: true,
+      brightness: brightness,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is AppThemeSettings &&
+      other.preset.argb == preset.argb &&
+      other.brightness == brightness;
+
+  @override
+  int get hashCode => Object.hash(preset.argb, brightness);
+}
+
+/// Holds the live theme at the app root. Library code only ever calls
+/// [select]; [PanelShiftApp] listens and rebuilds the [MaterialApp] with the
+/// new [ThemeData], so the screen below keeps its State (scroll position,
+/// search, selection, pre-indexer queue).
+class AppThemeController extends ValueNotifier<AppThemeSettings> {
+  AppThemeController([AppThemeSettings initial = AppThemeSettings.defaults])
+    : super(initial);
+
+  static const String seedKey = 'panelshift.themeSeed.v1';
+  static const String brightnessKey = 'panelshift.themeBrightness.v1';
+
+  static Future<AppThemeSettings> loadSaved() async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      return AppThemeSettings(
+        preset: AppThemePresets.byArgb(prefs.getInt(seedKey)),
+        brightness: prefs.getString(brightnessKey) == Brightness.light.name
+            ? Brightness.light
+            : Brightness.dark,
+      );
+    } catch (e) {
+      debugPrint('PanelShift: could not load theme: $e');
+      return AppThemeSettings.defaults;
+    }
+  }
+
+  void select({AppThemePreset? preset, Brightness? brightness}) {
+    final AppThemeSettings next = AppThemeSettings(
+      preset: preset ?? value.preset,
+      brightness: brightness ?? value.brightness,
+    );
+    if (next == value) return;
+    value = next;
+    unawaited(_save(next));
+  }
+
+  Future<void> _save(AppThemeSettings settings) async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(seedKey, settings.preset.argb);
+      await prefs.setString(brightnessKey, settings.brightness.name);
+    } catch (e) {
+      debugPrint('PanelShift: could not save theme: $e');
+    }
+  }
+}
+
+class PanelShiftApp extends StatefulWidget {
+  const PanelShiftApp({
+    super.key,
+    this.initialTheme = AppThemeSettings.defaults,
+  });
+
+  final AppThemeSettings initialTheme;
+
+  @override
+  State<PanelShiftApp> createState() => _PanelShiftAppState();
+}
+
+class _PanelShiftAppState extends State<PanelShiftApp> {
+  late final AppThemeController _theme = AppThemeController(
+    widget.initialTheme,
+  );
+
+  // Built once and handed to the builder as its `child`: a theme change
+  // rebuilds MaterialApp only, and the screen's State is never replaced.
+  late final Widget _home = ComicProcessorScreen(
+    title: 'PanelShift Core Engine',
+    themeController: _theme,
+  );
+
+  @override
+  void dispose() {
+    _theme.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'PanelShift Core',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.deepPurple,
-          brightness: Brightness.dark,
-        ),
-        useMaterial3: true,
-        brightness: Brightness.dark,
-      ),
-      home: const ComicProcessorScreen(title: 'PanelShift Core Engine'),
+    return ValueListenableBuilder<AppThemeSettings>(
+      valueListenable: _theme,
+      child: _home,
+      builder: (BuildContext context, AppThemeSettings settings, Widget? home) {
+        return MaterialApp(
+          title: 'PanelShift Core',
+          theme: settings.toThemeData(),
+          home: home,
+        );
+      },
     );
   }
 }
 
 /// ==========================================
-/// 1. Library Dashboard (import + grid/list)
+/// 1. Library Dashboard (import + grid/list/stack)
 /// ==========================================
-enum LibraryViewMode { grid, list }
+/// How the library is laid out. The enum [name] is what gets persisted.
+///  * [grid]  - covers in columns,
+///  * [list]  - one card per row,
+///  * [stack] - a vertical pile of horizontal book spines (leftmost fifth of
+///    each cover wrapped around the spine),
+///  * [verticalStack] - rows of upright book spines standing side by side on
+///    shelves (leftmost fifth of each cover running top to bottom).
+enum LibraryViewMode { grid, list, stack, verticalStack }
 
 /// Sort criteria for the library dashboard. The enum [name] is what gets
 /// persisted in SharedPreferences.
@@ -70,7 +250,7 @@ enum LibrarySort {
   final String label;
 }
 
-enum _LibraryMenuAction { deleteRead }
+enum _LibraryMenuAction { columns, theme, deleteRead }
 
 enum _ImportChoice { file, folder }
 
@@ -101,9 +281,17 @@ class _FolderComicEntry {
 enum _FileDeleteOutcome { deleted, skippedExternal, protectedOrLocked }
 
 class ComicProcessorScreen extends StatefulWidget {
-  const ComicProcessorScreen({super.key, required this.title});
+  const ComicProcessorScreen({
+    super.key,
+    required this.title,
+    this.themeController,
+  });
 
   final String title;
+
+  /// Owned by [PanelShiftApp]. When null (for example in a widget test) the
+  /// Theme button is simply not shown.
+  final AppThemeController? themeController;
 
   @override
   State<ComicProcessorScreen> createState() => _ComicProcessorScreenState();
@@ -113,6 +301,7 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   static const String _viewModeKey = 'panelshift.libraryViewMode.v1';
   static const String _bookshelfModeKey = 'panelshift.bookshelfMode.v1';
   static const String _sortKey = 'panelshift.librarySort.v1';
+  static const String _gridColumnsKey = 'panelshift.gridColumns.v1';
   static const String _originalSourcesKey = 'panelshift.originalSources.v1';
   static const MethodChannel _safChannel = MethodChannel('panelshift/saf_picker');
 
@@ -145,16 +334,23 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   bool _isBookshelfMode = false;
   bool _bookshelfModeLoaded = false;
 
+  // Comics per row in the grid: 0 = Auto (responsive), otherwise 2..6.
+  static const List<int> _columnChoices = <int>[0, 2, 3, 4, 5, 6];
+  int _gridColumns = 0;
+  bool _gridColumnsLoaded = false;
+
   // One controller per layout: each scroll view keeps its own position and the
   // painted shelves can follow it. [_libraryWidth] is cached from the latest
   // layout pass so toggling bookshelf mode can re-map the scroll offset.
   final ScrollController _gridScroll = ScrollController();
   final ScrollController _listScroll = ScrollController();
+  final ScrollController _stackScroll = ScrollController();
+  final ScrollController _verticalStackScroll = ScrollController();
   double _libraryWidth = 0;
 
   // Sorting + searching. [_library] is the raw registry, [_sorted] is the
   // whole library in the chosen order and [_visible] is [_sorted] narrowed by
-  // the search query. The grid and the list always render [_visible].
+  // the search query. The grid, list and stack always render [_visible].
   LibrarySort _sort = LibrarySort.newestFirst;
   bool _sortLoaded = false;
   bool _isSearching = false;
@@ -188,6 +384,7 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     ReadingProgressService.changes.addListener(_refreshReadTimes);
     unawaited(_loadViewMode());
     unawaited(_loadBookshelfMode());
+    unawaited(_loadGridColumns());
     unawaited(_loadSort());
     unawaited(_loadLibrary());
   }
@@ -201,6 +398,8 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     _searchController.dispose();
     _gridScroll.dispose();
     _listScroll.dispose();
+    _stackScroll.dispose();
+    _verticalStackScroll.dispose();
     super.dispose();
   }
 
@@ -336,8 +535,12 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     LibraryViewMode mode = LibraryViewMode.grid;
     try {
       final SharedPreferences prefs = await SharedPreferences.getInstance();
-      if (prefs.getString(_viewModeKey) == LibraryViewMode.list.name) {
-        mode = LibraryViewMode.list;
+      final String? stored = prefs.getString(_viewModeKey);
+      for (final LibraryViewMode candidate in LibraryViewMode.values) {
+        if (candidate.name == stored) {
+          mode = candidate;
+          break;
+        }
       }
     } catch (e) {
       debugPrint('PanelShift: could not load view mode: $e');
@@ -358,10 +561,33 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     }
   }
 
+  /// The mode the view-mode button switches to:
+  /// grid -> list -> stack -> verticalStack -> grid.
+  LibraryViewMode get _nextViewMode => switch (_viewMode) {
+    LibraryViewMode.grid => LibraryViewMode.list,
+    LibraryViewMode.list => LibraryViewMode.stack,
+    LibraryViewMode.stack => LibraryViewMode.verticalStack,
+    LibraryViewMode.verticalStack => LibraryViewMode.grid,
+  };
+
+  /// The button shows the mode a tap leads to (same convention as before:
+  /// grid shows the list icon, and so on).
+  IconData get _viewModeIcon => switch (_nextViewMode) {
+    LibraryViewMode.grid => Icons.grid_view,
+    LibraryViewMode.list => Icons.view_list,
+    LibraryViewMode.stack => Icons.view_agenda_outlined,
+    LibraryViewMode.verticalStack => Icons.view_week_outlined,
+  };
+
+  String get _viewModeTooltip => switch (_nextViewMode) {
+    LibraryViewMode.grid => 'Switch to grid view',
+    LibraryViewMode.list => 'Switch to list view',
+    LibraryViewMode.stack => 'Switch to stack view',
+    LibraryViewMode.verticalStack => 'Switch to vertical shelf stack view',
+  };
+
   void _toggleViewMode() {
-    final LibraryViewMode next = _viewMode == LibraryViewMode.grid
-        ? LibraryViewMode.list
-        : LibraryViewMode.grid;
+    final LibraryViewMode next = _nextViewMode;
     setState(() => _viewMode = next);
     unawaited(_saveViewMode(next));
   }
@@ -397,6 +623,104 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     _remapScrollOffset(toBookshelf: next);
     setState(() => _isBookshelfMode = next);
     unawaited(_saveBookshelfMode(next));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Comics per row
+  // ---------------------------------------------------------------------------
+
+  Future<void> _loadGridColumns() async {
+    int columns = 0;
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      final int? stored = prefs.getInt(_gridColumnsKey);
+      if (stored != null && _columnChoices.contains(stored)) columns = stored;
+    } catch (e) {
+      debugPrint('PanelShift: could not load grid columns: $e');
+    }
+    if (!mounted) return;
+    setState(() {
+      _gridColumns = columns;
+      _gridColumnsLoaded = true;
+    });
+  }
+
+  Future<void> _saveGridColumns(int columns) async {
+    try {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_gridColumnsKey, columns);
+    } catch (e) {
+      debugPrint('PanelShift: could not save grid columns: $e');
+    }
+  }
+
+  void _setGridColumns(int columns) {
+    if (columns == _gridColumns || !_columnChoices.contains(columns)) return;
+    // Re-map the scroll offset *before* the rebuild so the same comics stay
+    // on screen even though the rows get taller/shorter and hold a different
+    // number of comics.
+    _remapScrollOffset(toBookshelf: _isBookshelfMode, toColumns: columns);
+    setState(() => _gridColumns = columns);
+    unawaited(_saveGridColumns(columns));
+  }
+
+  String get _columnsLabel => _gridColumns == 0 ? 'Auto' : '$_gridColumns';
+
+  Future<void> _showColumnsDialog() async {
+    // "Comics per row" only exists in the grid: list and stack have one comic
+    // per row.
+    if (_viewMode != LibraryViewMode.grid) return;
+    if (!_gridColumnsLoaded) return;
+    final int? choice = await showDialog<int>(
+      context: context,
+      builder: (BuildContext dialogContext) => AlertDialog(
+        title: const Text('Comics per row'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final int value in _columnChoices)
+                  ChoiceChip(
+                    label: Text(value == 0 ? 'Auto' : '$value'),
+                    selected: value == _gridColumns,
+                    onSelected: (_) => Navigator.pop(dialogContext, value),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Auto fits as many comics as the screen width allows.',
+              style: Theme.of(dialogContext).textTheme.bodySmall,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+    if (choice != null && mounted) _setGridColumns(choice);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Theme
+  // ---------------------------------------------------------------------------
+
+  Future<void> _showThemeDialog() async {
+    final AppThemeController? controller = widget.themeController;
+    if (controller == null) return;
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext dialogContext) =>
+          _ThemeDialog(controller: controller),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -577,6 +901,8 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     for (final ScrollController controller in <ScrollController>[
       _gridScroll,
       _listScroll,
+      _stackScroll,
+      _verticalStackScroll,
     ]) {
       if (controller.hasClients) controller.jumpTo(0);
     }
@@ -643,30 +969,57 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     _onSearchChanged('');
   }
 
-  _LibraryLayout _layoutFor(LibraryViewMode mode, bool bookshelf) {
-    return mode == LibraryViewMode.grid
-        ? _LibraryLayout.grid(_libraryWidth, bookshelf: bookshelf)
-        : _LibraryLayout.list(bookshelf: bookshelf);
+  _LibraryLayout _layoutFor(
+    LibraryViewMode mode,
+    bool bookshelf, {
+    int? columns,
+  }) {
+    return switch (mode) {
+      LibraryViewMode.grid => _LibraryLayout.grid(
+        _libraryWidth,
+        bookshelf: bookshelf,
+        columns: columns ?? _gridColumns,
+      ),
+      LibraryViewMode.list => _LibraryLayout.list(bookshelf: bookshelf),
+      LibraryViewMode.stack => _LibraryLayout.stack(bookshelf: bookshelf),
+      LibraryViewMode.verticalStack => _LibraryLayout.verticalStack(
+        _libraryWidth,
+        bookshelf: bookshelf,
+      ),
+    };
   }
 
-  /// Keeps the same "row position" when the row height changes between
-  /// normal and bookshelf layouts.
-  void _remapScrollOffset({required bool toBookshelf}) {
-    final ScrollController controller = _viewMode == LibraryViewMode.grid
-        ? _gridScroll
-        : _listScroll;
+  /// Keeps the same place in the library when the layout changes between
+  /// normal and bookshelf rows, or when the grid's column count changes. The
+  /// position is tracked as "which comic is at the top", so it survives a
+  /// different number of comics per row.
+  void _remapScrollOffset({required bool toBookshelf, int? toColumns}) {
+    final ScrollController controller = switch (_viewMode) {
+      LibraryViewMode.grid => _gridScroll,
+      LibraryViewMode.list => _listScroll,
+      LibraryViewMode.stack => _stackScroll,
+      LibraryViewMode.verticalStack => _verticalStackScroll,
+    };
     if (_libraryWidth <= 0 || controller.positions.isEmpty) return;
 
     final ScrollPosition position = controller.positions.last;
     if (!position.hasPixels || !position.hasViewportDimension) return;
 
     final _LibraryLayout before = _layoutFor(_viewMode, _isBookshelfMode);
-    final _LibraryLayout after = _layoutFor(_viewMode, toBookshelf);
+    final _LibraryLayout after = _layoutFor(
+      _viewMode,
+      toBookshelf,
+      columns: toColumns,
+    );
     if (before.rowStride <= 0 || after.rowStride <= 0) return;
 
     final double rowPosition =
         (position.pixels - before.topInset) / before.rowStride;
-    final double target = after.topInset + rowPosition * after.rowStride;
+    // Row -> comic position -> row of the new layout (identical when the
+    // column count does not change).
+    final double itemPosition = rowPosition * before.crossAxisCount;
+    final double newRowPosition = itemPosition / after.crossAxisCount;
+    final double target = after.topInset + newRowPosition * after.rowStride;
     final double maxExtent = math.max(
       0.0,
       after.contentExtent(_visible.length) - position.viewportDimension,
@@ -1831,77 +2184,10 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
   }
 
   Widget _buildScaffold(BuildContext context) {
-    final bool isGrid = _viewMode == LibraryViewMode.grid;
-    final ColorScheme scheme = Theme.of(context).colorScheme;
-
     return Scaffold(
       appBar: _isSelecting
           ? _buildSelectionAppBar(context)
-          : AppBar(
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: Text(widget.title),
-        actions: [
-          IconButton(
-            tooltip: _isSearching ? 'Close search' : 'Search library',
-            icon: Icon(_isSearching ? Icons.search_off : Icons.search),
-            onPressed: _toggleSearch,
-          ),
-          PopupMenuButton<LibrarySort>(
-            tooltip: 'Sort library',
-            icon: const Icon(Icons.sort),
-            enabled: _sortLoaded,
-            onSelected: _setSort,
-            itemBuilder: (BuildContext context) => <PopupMenuEntry<LibrarySort>>[
-              for (final LibrarySort sort in LibrarySort.values)
-                CheckedPopupMenuItem<LibrarySort>(
-                  value: sort,
-                  checked: sort == _sort,
-                  child: Text(sort.label),
-                ),
-            ],
-          ),
-          IconButton(
-            tooltip: isGrid ? 'Switch to list view' : 'Switch to grid view',
-            icon: Icon(isGrid ? Icons.view_list : Icons.grid_view),
-            onPressed: _viewModeLoaded ? _toggleViewMode : null,
-          ),
-          IconButton(
-            tooltip: _isBookshelfMode
-                ? 'Turn bookshelf mode off'
-                : 'Turn bookshelf mode on',
-            isSelected: _isBookshelfMode,
-            icon: const Icon(Icons.shelves),
-            style: IconButton.styleFrom(
-              backgroundColor: _isBookshelfMode ? scheme.surface : null,
-              foregroundColor: _isBookshelfMode ? scheme.primary : null,
-            ),
-            onPressed: _bookshelfModeLoaded ? _toggleBookshelfMode : null,
-          ),
-          PopupMenuButton<_LibraryMenuAction>(
-            tooltip: 'More options',
-            onSelected: (_LibraryMenuAction action) {
-              switch (action) {
-                case _LibraryMenuAction.deleteRead:
-                  unawaited(_confirmDeleteAllRead());
-              }
-            },
-            itemBuilder: (BuildContext context) =>
-                <PopupMenuEntry<_LibraryMenuAction>>[
-                  PopupMenuItem<_LibraryMenuAction>(
-                    value: _LibraryMenuAction.deleteRead,
-                    enabled: !_isProcessing && _library.isNotEmpty,
-                    child: const Row(
-                      children: [
-                        Icon(Icons.delete_sweep_outlined),
-                        SizedBox(width: 12),
-                        Text('Delete all read'),
-                      ],
-                    ),
-                  ),
-                ],
-          ),
-        ],
-      ),
+          : _buildLibraryAppBar(context),
       floatingActionButton: _isSelecting
           ? null
           : FloatingActionButton.extended(
@@ -1915,6 +2201,146 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
           _buildSearchBar(),
           Expanded(child: _buildLibrary()),
         ],
+      ),
+    );
+  }
+
+  /// Normal library bar. Fit rules for narrow phones (360 dp):
+  ///  * every action is 40 dp wide instead of 48 (shrink-wrapped tap targets),
+  ///  * the title scales down instead of being cut off with an ellipsis,
+  ///  * Columns and Theme get their own buttons only from 600 dp up; on phones
+  ///    they sit in the overflow menu next to "Delete all read", so the bar
+  ///    carries no more icons than before.
+  PreferredSizeWidget _buildLibraryAppBar(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final ColorScheme scheme = theme.colorScheme;
+    final bool isGrid = _viewMode == LibraryViewMode.grid;
+    final bool roomy = MediaQuery.sizeOf(context).width >= 600;
+    final bool canTheme = widget.themeController != null;
+    final bool menuHasColumns = !roomy && isGrid;
+    final bool menuHasTheme = !roomy && canTheme;
+
+    return PreferredSize(
+      preferredSize: const Size.fromHeight(kToolbarHeight),
+      child: Theme(
+        data: theme.copyWith(
+          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        child: AppBar(
+          backgroundColor: scheme.inversePrimary,
+          titleSpacing: 12,
+          title: FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(widget.title),
+          ),
+          actions: [
+            IconButton(
+              tooltip: _isSearching ? 'Close search' : 'Search library',
+              icon: Icon(_isSearching ? Icons.search_off : Icons.search),
+              onPressed: _toggleSearch,
+            ),
+            PopupMenuButton<LibrarySort>(
+              tooltip: 'Sort library',
+              icon: const Icon(Icons.sort),
+              enabled: _sortLoaded,
+              onSelected: _setSort,
+              itemBuilder: (BuildContext context) =>
+                  <PopupMenuEntry<LibrarySort>>[
+                    for (final LibrarySort sort in LibrarySort.values)
+                      CheckedPopupMenuItem<LibrarySort>(
+                        value: sort,
+                        checked: sort == _sort,
+                        child: Text(sort.label),
+                      ),
+                  ],
+            ),
+            IconButton(
+              tooltip: _viewModeTooltip,
+              icon: Icon(_viewModeIcon),
+              onPressed: _viewModeLoaded ? _toggleViewMode : null,
+            ),
+            IconButton(
+              tooltip: _isBookshelfMode
+                  ? 'Turn bookshelf mode off'
+                  : 'Turn bookshelf mode on',
+              isSelected: _isBookshelfMode,
+              icon: const Icon(Icons.shelves),
+              style: IconButton.styleFrom(
+                backgroundColor: _isBookshelfMode ? scheme.surface : null,
+                foregroundColor: _isBookshelfMode ? scheme.primary : null,
+              ),
+              onPressed: _bookshelfModeLoaded ? _toggleBookshelfMode : null,
+            ),
+            // Grid only: list and stack have no "comics per row".
+            if (roomy && isGrid)
+              IconButton(
+                tooltip: 'Comics per row ($_columnsLabel)',
+                icon: const Icon(Icons.view_column_outlined),
+                onPressed: _gridColumnsLoaded && isGrid
+                    ? () => unawaited(_showColumnsDialog())
+                    : null,
+              ),
+            if (roomy && canTheme)
+              IconButton(
+                tooltip: 'Theme',
+                icon: const Icon(Icons.palette_outlined),
+                onPressed: () => unawaited(_showThemeDialog()),
+              ),
+            PopupMenuButton<_LibraryMenuAction>(
+              tooltip: 'More options',
+              onSelected: (_LibraryMenuAction action) {
+                switch (action) {
+                  case _LibraryMenuAction.columns:
+                    unawaited(_showColumnsDialog());
+                  case _LibraryMenuAction.theme:
+                    unawaited(_showThemeDialog());
+                  case _LibraryMenuAction.deleteRead:
+                    unawaited(_confirmDeleteAllRead());
+                }
+              },
+              itemBuilder: (BuildContext context) =>
+                  <PopupMenuEntry<_LibraryMenuAction>>[
+                    if (menuHasColumns)
+                      PopupMenuItem<_LibraryMenuAction>(
+                        value: _LibraryMenuAction.columns,
+                        enabled: _gridColumnsLoaded && isGrid,
+                        child: Row(
+                          children: [
+                            const Icon(Icons.view_column_outlined),
+                            const SizedBox(width: 12),
+                            Text('Columns ($_columnsLabel)'),
+                          ],
+                        ),
+                      ),
+                    if (menuHasTheme)
+                      const PopupMenuItem<_LibraryMenuAction>(
+                        value: _LibraryMenuAction.theme,
+                        child: Row(
+                          children: [
+                            Icon(Icons.palette_outlined),
+                            SizedBox(width: 12),
+                            Text('Theme'),
+                          ],
+                        ),
+                      ),
+                    if (menuHasColumns || menuHasTheme)
+                      const PopupMenuDivider(),
+                    PopupMenuItem<_LibraryMenuAction>(
+                      value: _LibraryMenuAction.deleteRead,
+                      enabled: !_isProcessing && _library.isNotEmpty,
+                      child: const Row(
+                        children: [
+                          Icon(Icons.delete_sweep_outlined),
+                          SizedBox(width: 12),
+                          Text('Delete all read'),
+                        ],
+                      ),
+                    ),
+                  ],
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -2019,6 +2445,7 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     if (!_libraryLoaded ||
         !_viewModeLoaded ||
         !_bookshelfModeLoaded ||
+        !_gridColumnsLoaded ||
         !_sortLoaded) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -2031,7 +2458,12 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
 
     return AnimatedSwitcher(
       duration: const Duration(milliseconds: 200),
-      child: _viewMode == LibraryViewMode.grid ? _buildGrid() : _buildList(),
+      child: switch (_viewMode) {
+        LibraryViewMode.grid => _buildGrid(),
+        LibraryViewMode.list => _buildList(),
+        LibraryViewMode.stack => _buildStack(),
+        LibraryViewMode.verticalStack => _buildVerticalStack(),
+      },
     );
   }
 
@@ -2063,6 +2495,7 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
     required _LibraryLayout layout,
     required int rowCount,
     required Widget scrollView,
+    bool drawIntermediateShelves = true,
   }) {
     final ThemeData theme = Theme.of(context);
     return Stack(
@@ -2079,6 +2512,7 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
                   topInset: layout.topInset,
                   rowStride: layout.rowStride,
                   bookBottom: layout.bookBottom,
+                  drawIntermediateShelves: drawIntermediateShelves,
                 )
               : const SizedBox.shrink(),
         ),
@@ -2102,6 +2536,7 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
         final _LibraryLayout layout = _LibraryLayout.grid(
           constraints.maxWidth,
           bookshelf: shelf,
+          columns: _gridColumns,
         );
 
         return _withShelves(
@@ -2183,6 +2618,255 @@ class _ComicProcessorScreenState extends State<ComicProcessorScreen> {
       },
     );
   }
+
+  /// Stack mode: one horizontal book spine per row, lazily built with a fixed
+  /// extent. In bookshelf mode the spines touch and form a pile resting on the
+  /// bottom plank, so [_ShelfBackdrop] skips the planks between rows.
+  Widget _buildStack() {
+    final bool shelf = _isBookshelfMode;
+
+    return LayoutBuilder(
+      key: const ValueKey<String>('library-stack-layer'),
+      builder: (BuildContext context, BoxConstraints constraints) {
+        _libraryWidth = constraints.maxWidth;
+        final _LibraryLayout layout = _LibraryLayout.stack(bookshelf: shelf);
+
+        return _withShelves(
+          bookshelf: shelf,
+          controller: _stackScroll,
+          layout: layout,
+          rowCount: _visible.length,
+          // No wooden plank between stacked books (this layer only exists
+          // while the view mode is LibraryViewMode.stack).
+          drawIntermediateShelves: false,
+          scrollView: ListView.builder(
+            key: const PageStorageKey<String>('library-stack'),
+            controller: _stackScroll,
+            padding: layout.padding,
+            itemExtent: layout.cellHeight,
+            itemCount: _visible.length,
+            addAutomaticKeepAlives: false,
+            addRepaintBoundaries: true,
+            itemBuilder: (BuildContext context, int index) {
+              final ComicIdentity comic = _visible[index];
+              return _ComicEntry(
+                key: ValueKey<String>(comic.id),
+                comic: comic,
+                layout: _EntryLayout.stack,
+                bookshelf: shelf,
+                isSelected: _selectedIds.contains(comic.id),
+                isSelectionMode: _isSelecting,
+                onTap: () => _onEntryTap(comic),
+                onLongPress: () => _onEntryLongPress(comic),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  /// Vertical shelf stack: upright book spines standing side by side, as many
+  /// per row as the shelf is wide, on shelves with the same compartment height
+  /// as the 4-comics-per-row grid. Rows (and their planks) stack vertically as
+  /// the library grows, exactly like the grid.
+  Widget _buildVerticalStack() {
+    final bool shelf = _isBookshelfMode;
+
+    return LayoutBuilder(
+      key: const ValueKey<String>('library-vertical-stack-layer'),
+      builder: (BuildContext context, BoxConstraints constraints) {
+        _libraryWidth = constraints.maxWidth;
+        final _LibraryLayout layout = _LibraryLayout.verticalStack(
+          constraints.maxWidth,
+          bookshelf: shelf,
+        );
+
+        return _withShelves(
+          bookshelf: shelf,
+          controller: _verticalStackScroll,
+          layout: layout,
+          rowCount: layout.rowCount(_visible.length),
+          scrollView: GridView.builder(
+            key: const PageStorageKey<String>('library-vertical-stack'),
+            controller: _verticalStackScroll,
+            padding: layout.padding,
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: layout.crossAxisCount,
+              mainAxisSpacing: layout.mainAxisSpacing,
+              crossAxisSpacing: layout.crossAxisSpacing,
+              mainAxisExtent: layout.cellHeight,
+            ),
+            itemCount: _visible.length,
+            addAutomaticKeepAlives: false,
+            addRepaintBoundaries: true,
+            itemBuilder: (BuildContext context, int index) {
+              final ComicIdentity comic = _visible[index];
+              return _ComicEntry(
+                key: ValueKey<String>(comic.id),
+                comic: comic,
+                layout: _EntryLayout.verticalStack,
+                bookshelf: shelf,
+                isSelected: _selectedIds.contains(comic.id),
+                isSelectionMode: _isSelecting,
+                onTap: () => _onEntryTap(comic),
+                onLongPress: () => _onEntryLongPress(comic),
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Compact theme chooser. Choices apply immediately (live preview) and are
+/// persisted by [AppThemeController]; the dialog just listens to it.
+class _ThemeDialog extends StatelessWidget {
+  const _ThemeDialog({required this.controller});
+
+  final AppThemeController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final TextTheme text = Theme.of(context).textTheme;
+    return AlertDialog(
+      title: const Text('Theme'),
+      contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+      content: SizedBox(
+        width: 320,
+        child: ValueListenableBuilder<AppThemeSettings>(
+          valueListenable: controller,
+          builder: (BuildContext context, AppThemeSettings settings, _) {
+            return SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Color', style: text.labelLarge),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 8,
+                    children: [
+                      for (final AppThemePreset preset in AppThemePresets.all)
+                        _ThemeSwatch(
+                          preset: preset,
+                          selected: preset.argb == settings.preset.argb,
+                          onTap: () => controller.select(preset: preset),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+                  Text('Mode', style: text.labelLarge),
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    child: SegmentedButton<Brightness>(
+                      showSelectedIcon: false,
+                      segments: const <ButtonSegment<Brightness>>[
+                        ButtonSegment<Brightness>(
+                          value: Brightness.dark,
+                          icon: Icon(Icons.dark_mode_outlined),
+                          label: Text('Dark'),
+                        ),
+                        ButtonSegment<Brightness>(
+                          value: Brightness.light,
+                          icon: Icon(Icons.light_mode_outlined),
+                          label: Text('Light'),
+                        ),
+                      ],
+                      selected: <Brightness>{settings.brightness},
+                      onSelectionChanged: (Set<Brightness> selection) =>
+                          controller.select(brightness: selection.first),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'Bookshelf wood follows the mode: walnut in dark, oak in '
+                    'light.',
+                    style: text.bodySmall,
+                  ),
+                  const SizedBox(height: 8),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Done'),
+        ),
+      ],
+    );
+  }
+}
+
+class _ThemeSwatch extends StatelessWidget {
+  const _ThemeSwatch({
+    required this.preset,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final AppThemePreset preset;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final Color color = preset.color;
+    final Color onColor =
+        ThemeData.estimateBrightnessForColor(color) == Brightness.dark
+        ? Colors.white
+        : Colors.black;
+
+    return SizedBox(
+      width: 72,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: color,
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: selected ? scheme.primary : scheme.outlineVariant,
+                    width: selected ? 3 : 1,
+                  ),
+                ),
+                child: SizedBox(
+                  width: 40,
+                  height: 40,
+                  child: selected
+                      ? Icon(Icons.check, size: 20, color: onColor)
+                      : null,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                preset.name,
+                maxLines: 2,
+                textAlign: TextAlign.center,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(
+                  context,
+                ).textTheme.labelSmall?.copyWith(fontSize: 10.5, height: 1.15),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _EmptyLibrary extends StatelessWidget {
@@ -2259,9 +2943,9 @@ class _NoSearchResults extends StatelessWidget {
 }
 
 /// ==========================================
-/// 2. Library card (shared by grid and list)
+/// 2. Library card (shared by grid, list, stack and vertical stack)
 /// ==========================================
-enum _EntryLayout { grid, list }
+enum _EntryLayout { grid, list, stack, verticalStack }
 
 class _ProgressSummary {
   const _ProgressSummary({
@@ -2417,10 +3101,43 @@ class _ComicEntryState extends State<_ComicEntry> {
       builder: (BuildContext context, AsyncSnapshot<ComicCover?> snapshot) {
         final ComicCover? cover = snapshot.data;
         final bool isGrid = widget.layout == _EntryLayout.grid;
+        final bool isStack = widget.layout == _EntryLayout.stack;
+        final bool isVerticalStack =
+            widget.layout == _EntryLayout.verticalStack;
         final _ProgressSummary? summary = _summarize(
           cover?.pageCount,
-          compact: isGrid,
+          compact: isGrid || isStack || isVerticalStack,
         );
+
+        // Upright spine: same leftmost-fifth art as the horizontal spine, but
+        // running top to bottom (no rotation). It carries no text at all.
+        if (isVerticalStack) {
+          final Widget spineCover = _buildVerticalSpineCover(
+            context,
+            cover,
+            finished: summary?.finished ?? false,
+          );
+          return Semantics(
+            label: widget.comic.title,
+            child: widget.bookshelf
+                ? _buildShelfVerticalStackTile(context, spineCover, summary)
+                : _buildVerticalStackTile(context, spineCover, summary),
+          );
+        }
+
+        // A spine shows only the leftmost fifth of the cover, so it has its
+        // own (smaller) decode path instead of the full-cover widget below.
+        if (isStack) {
+          final Widget spineCover = _buildSpineCover(
+            context,
+            cover,
+            finished: summary?.finished ?? false,
+          );
+          return widget.bookshelf
+              ? _buildShelfStackTile(context, spineCover, summary)
+              : _buildStackTile(context, spineCover, summary);
+        }
+
         final Widget coverWidget = _buildCover(
           context,
           cover,
@@ -2528,8 +3245,39 @@ class _ComicEntryState extends State<_ComicEntry> {
   /// the selection indicator (see [_selectionMarks]); finished comics are
   /// shown with a black-and-white cover instead. In selection mode the badge
   /// moves to the top-left so it never sits under the indicator.
-  Widget _statusBadge(ColorScheme scheme, _ProgressSummary? summary) {
+  Widget _statusBadge(
+    ColorScheme scheme,
+    _ProgressSummary? summary, {
+    bool compact = false,
+  }) {
     if (!_sourceMissing) return const SizedBox.shrink();
+
+    // Narrow upright spine (~40 dp): a small centered badge just above the
+    // progress bar, so it never meets the selection circle at the top.
+    if (compact) {
+      return Positioned(
+        left: 0,
+        right: 0,
+        bottom: 8,
+        child: Center(
+          heightFactor: 1,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: scheme.errorContainer,
+              shape: BoxShape.circle,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(3),
+              child: Icon(
+                Icons.link_off,
+                size: 12,
+                color: scheme.onErrorContainer,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
 
     return Positioned(
       top: 6,
@@ -2556,9 +3304,40 @@ class _ComicEntryState extends State<_ComicEntry> {
   /// while in selection mode, and on the selected ones a filled check badge
   /// (top right), a light tint and, with [outline], a border. Pass
   /// `outline: false` where the surrounding [Card] draws the border itself.
-  Widget _selectionMarks(ColorScheme scheme, {bool outline = true}) {
+  Widget _selectionMarks(
+    ColorScheme scheme, {
+    bool outline = true,
+    bool compact = false,
+  }) {
     if (!widget.isSelectionMode) return const SizedBox.shrink();
     final bool selected = widget.isSelected;
+    // Compact (narrow upright spine): a 20 dp circle centered at the top
+    // instead of a 24 dp one in the corner, so it fits without clipping.
+    final double markSize = compact ? 20 : 24;
+    final double checkSize = compact ? 12 : 14;
+    final Widget markCircle = SizedBox(
+      width: markSize,
+      height: markSize,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: selected ? scheme.primary : Colors.black38,
+          border: Border.all(
+            color: selected ? scheme.onPrimary : Colors.white,
+            width: 2,
+          ),
+        ),
+        child: selected
+            ? Center(
+                child: Icon(
+                  Icons.check,
+                  size: checkSize,
+                  color: scheme.onPrimary,
+                ),
+              )
+            : null,
+      ),
+    );
 
     return Positioned.fill(
       child: IgnorePointer(
@@ -2576,30 +3355,11 @@ class _ComicEntryState extends State<_ComicEntry> {
               ),
             Positioned(
               top: 6,
-              right: 6,
-              child: SizedBox(
-                width: 24,
-                height: 24,
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: selected ? scheme.primary : Colors.black38,
-                    border: Border.all(
-                      color: selected ? scheme.onPrimary : Colors.white,
-                      width: 2,
-                    ),
-                  ),
-                  child: selected
-                      ? Center(
-                          child: Icon(
-                            Icons.check,
-                            size: 14,
-                            color: scheme.onPrimary,
-                          ),
-                        )
-                      : null,
-                ),
-              ),
+              left: compact ? 0 : null,
+              right: compact ? 0 : 6,
+              child: compact
+                  ? Center(heightFactor: 1, child: markCircle)
+                  : markCircle,
             ),
           ],
         ),
@@ -2752,6 +3512,468 @@ class _ComicEntryState extends State<_ComicEntry> {
           ),
         ),
       ),
+    );
+  }
+
+  // --- stack layout (book spines) -------------------------------------------
+
+  /// Fraction of the cover's width that wraps the spine (its leftmost edge).
+  static const double _kSpineCoverFraction = 0.2;
+
+  /// Hard ceiling for a spine cover's decoded width. The whole cover is
+  /// decoded (only its left fifth is visible), so this is kept well under
+  /// [_kCoverDecodeCeiling]: ~0.4 MB per cover instead of ~1.4 MB.
+  static const int _kSpineDecodeCeiling = 256;
+
+  static const BorderRadius _spineRadius = BorderRadius.horizontal(
+    left: Radius.circular(6),
+    right: Radius.circular(6),
+  );
+
+  /// Everything that sits on top of the spine art, as one const (never
+  /// rebuilt) layer set: a dark scrim so text stays readable over bright
+  /// covers, rounded book-end cap shading, a top highlight and a bottom
+  /// contact shadow. The shadow is painted *inside* each spine because the
+  /// next spine in the pile paints over anything spilling out of this one.
+  static const Widget _spineShade = Stack(
+    fit: StackFit.expand,
+    children: [
+      // Readability scrim (heavier under the title side).
+      DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.centerLeft,
+            end: Alignment.centerRight,
+            colors: [Color(0xB3000000), Color(0x8C000000)],
+          ),
+        ),
+      ),
+      // Rounded left / right book-end caps.
+      DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.centerLeft,
+            end: Alignment.centerRight,
+            stops: [0.0, 0.035, 0.08, 0.92, 0.965, 1.0],
+            colors: [
+              Color(0x99000000),
+              Color(0x40000000),
+              Color(0x00000000),
+              Color(0x00000000),
+              Color(0x33000000),
+              Color(0x80000000),
+            ],
+          ),
+        ),
+      ),
+      // Top highlight line + bottom contact shadow.
+      DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            stops: [0.0, 0.03, 0.045, 0.66, 0.94, 1.0],
+            colors: [
+              Color(0x66FFFFFF),
+              Color(0x59FFFFFF),
+              Color(0x00FFFFFF),
+              Color(0x00000000),
+              Color(0x66000000),
+              Color(0xB3000000),
+            ],
+          ),
+        ),
+      ),
+    ],
+  );
+
+  static const List<Shadow> _spineTextShadows = <Shadow>[
+    Shadow(color: Color(0xCC000000), blurRadius: 3, offset: Offset(0, 1)),
+  ];
+
+  /// The leftmost 20 % of [cover], filling [constraints] (tight, finite). The
+  /// cover is laid out 5x the strip's width and clipped to its left fifth;
+  /// both spine layouts use this, the horizontal one inside a [RotatedBox].
+  Widget _buildCoverStrip(
+    BuildContext context,
+    ComicCover cover,
+    BoxConstraints constraints, {
+    required bool finished,
+    required Widget placeholder,
+  }) {
+    final double stripWidth = constraints.maxWidth;
+    final double stripHeight = constraints.maxHeight;
+    if (!stripWidth.isFinite ||
+        !stripHeight.isFinite ||
+        stripWidth <= 0 ||
+        stripHeight <= 0) {
+      return placeholder;
+    }
+    final double fullWidth = stripWidth / _kSpineCoverFraction;
+    final double dpr = MediaQuery.devicePixelRatioOf(context);
+
+    final Widget image = Image.file(
+      File(cover.path),
+      width: fullWidth,
+      height: stripHeight,
+      fit: BoxFit.cover,
+      // Keep the cover's left edge (and its top) when cropping.
+      alignment: Alignment.topLeft,
+      // Strictly bounded decode (<= 256 px wide).
+      cacheWidth: (fullWidth * dpr)
+          .ceil()
+          .clamp(96, _kSpineDecodeCeiling)
+          .toInt(),
+      filterQuality: FilterQuality.low,
+      gaplessPlayback: true,
+      frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+        if (wasSynchronouslyLoaded) return child;
+        return AnimatedOpacity(
+          opacity: frame == null ? 0 : 1,
+          duration: const Duration(milliseconds: 180),
+          child: child,
+        );
+      },
+      errorBuilder: (context, error, stackTrace) => placeholder,
+    );
+    // Finished comics are shown in black and white.
+    final Widget art = finished
+        ? ColorFiltered(colorFilter: _grayscaleFilter, child: image)
+        : image;
+
+    return ClipRect(
+      child: OverflowBox(
+        alignment: Alignment.centerLeft,
+        minWidth: 0,
+        maxWidth: fullWidth,
+        minHeight: stripHeight,
+        maxHeight: stripHeight,
+        child: Align(
+          alignment: Alignment.centerLeft,
+          widthFactor: _kSpineCoverFraction,
+          child: art,
+        ),
+      ),
+    );
+  }
+
+  /// Spine art: the leftmost 20 % of the cover, rotated a quarter turn so the
+  /// cover's left edge wraps horizontally across the spine. The cover is
+  /// laid out 5x the strip's width and clipped to its left fifth.
+  Widget _buildSpineCover(
+    BuildContext context,
+    ComicCover? cover, {
+    bool finished = false,
+  }) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final Widget placeholder = ColoredBox(color: scheme.surfaceContainerHighest);
+    if (cover == null) return placeholder;
+
+    return RotatedBox(
+      quarterTurns: 1,
+      // Inside the RotatedBox the constraints are transposed: maxWidth is the
+      // spine's thickness and maxHeight is its length.
+      child: LayoutBuilder(
+        builder: (BuildContext context, BoxConstraints constraints) {
+          return _buildCoverStrip(
+            context,
+            cover,
+            constraints,
+            finished: finished,
+            placeholder: placeholder,
+          );
+        },
+      ),
+    );
+  }
+
+  /// Short status for a spine: percentage while reading, else the status.
+  String _spineLabel(_ProgressSummary? summary) {
+    if (_sourceMissing) return 'File not found';
+    if (summary == null) return '';
+    if (summary.finished) return summary.label;
+    final double? fraction = summary.fraction;
+    if (fraction != null) return '${(fraction * 100).round()}%';
+    return summary.label;
+  }
+
+  /// One horizontal book spine. [bookshelf] only changes how the pile looks:
+  /// on a shelf the spines touch (the next one covers this one's shadow) and
+  /// cast a soft shadow sideways onto the wall; off a shelf each spine is an
+  /// inset rounded bar with a small gap above and below.
+  Widget _buildSpine(
+    BuildContext context,
+    Widget spineCover,
+    _ProgressSummary? summary, {
+    required bool bookshelf,
+  }) {
+    final ThemeData theme = Theme.of(context);
+    final ColorScheme scheme = theme.colorScheme;
+    final double? fraction = summary?.fraction;
+    final String label = _spineLabel(summary);
+
+    // Keep the title/label clear of the status badge and the selection
+    // circle (both 24 dp round marks that sit 6 dp in from a corner).
+    final bool badgeLeft = _sourceMissing && widget.isSelectionMode;
+    final double leftPad = badgeLeft ? 36 : 18;
+    final double rightPad = (widget.isSelectionMode || _sourceMissing) ? 36 : 14;
+
+    final Widget body = ClipRRect(
+      borderRadius: _spineRadius,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          spineCover,
+          _spineShade,
+          Positioned.fill(
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(leftPad, 0, rightPad, 3),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      widget.comic.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                        shadows: _spineTextShadows,
+                      ),
+                    ),
+                  ),
+                  if (label.isNotEmpty) ...[
+                    const SizedBox(width: 10),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 96),
+                      child: Text(
+                        label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          color: _sourceMissing
+                              ? scheme.errorContainer
+                              : const Color(0xE6FFFFFF),
+                          shadows: _spineTextShadows,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (fraction != null) _shelfProgressBar(fraction),
+          _statusBadge(scheme, summary),
+          _selectionMarks(scheme),
+          // Ripple sits above everything so it is actually visible.
+          Positioned.fill(
+            child: Material(
+              type: MaterialType.transparency,
+              child: InkWell(
+                onTap: widget.onTap,
+                onLongPress: widget.onLongPress,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (!bookshelf) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: _ShelfDims.stackGap / 2),
+        child: body,
+      );
+    }
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        borderRadius: _spineRadius,
+        boxShadow: <BoxShadow>[
+          // Soft shadow onto the back wall / plank beside the pile.
+          BoxShadow(
+            color: Color(0x73000000),
+            blurRadius: 5,
+            offset: Offset(2.5, 0.5),
+          ),
+        ],
+      ),
+      child: body,
+    );
+  }
+
+  /// Stack row outside bookshelf mode (gap between spines).
+  Widget _buildStackTile(
+    BuildContext context,
+    Widget spineCover,
+    _ProgressSummary? summary,
+  ) => _buildSpine(context, spineCover, summary, bookshelf: false);
+
+  /// Stack row in bookshelf mode: spines are stacked directly on top of each
+  /// other. The pile rests on the bottom plank drawn by [_BookshelfPainter];
+  /// there is no plank between books.
+  Widget _buildShelfStackTile(
+    BuildContext context,
+    Widget spineCover,
+    _ProgressSummary? summary,
+  ) => _buildSpine(context, spineCover, summary, bookshelf: true);
+
+  // --- vertical stack layout (upright book spines) ---------------------------
+
+  static const BorderRadius _verticalSpineRadius = BorderRadius.all(
+    Radius.circular(3),
+  );
+
+  /// Overlay for an upright spine, as one const layer set: a dark readability
+  /// scrim plus cylindrical left-to-right shading (left highlight, a curved
+  /// spine crease, right edge shadow) so books standing side by side read as
+  /// separate 3D objects.
+  static const Widget _verticalSpineShade = Stack(
+    fit: StackFit.expand,
+    children: [
+      // Dark scrim (a touch heavier at the foot, where the plank shadow is).
+      DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color(0x4D000000), Color(0x33000000), Color(0x80000000)],
+            stops: [0.0, 0.55, 1.0],
+          ),
+        ),
+      ),
+      // Cylinder: left highlight, crease, right edge shadow.
+      DecoratedBox(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.centerLeft,
+            end: Alignment.centerRight,
+            stops: [0.0, 0.07, 0.13, 0.18, 0.28, 0.72, 0.9, 1.0],
+            colors: [
+              Color(0x4DFFFFFF),
+              Color(0x1AFFFFFF),
+              Color(0x66000000),
+              Color(0x1FFFFFFF),
+              Color(0x00000000),
+              Color(0x00000000),
+              Color(0x40000000),
+              Color(0x99000000),
+            ],
+          ),
+        ),
+      ),
+    ],
+  );
+
+  /// Upright spine art: the leftmost 20 % of the cover running top to bottom
+  /// (no rotation). Same strip as [_buildSpineCover], 256 px decode ceiling.
+  Widget _buildVerticalSpineCover(
+    BuildContext context,
+    ComicCover? cover, {
+    bool finished = false,
+  }) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final Widget placeholder = ColoredBox(color: scheme.surfaceContainerHighest);
+    if (cover == null) return placeholder;
+
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        return _buildCoverStrip(
+          context,
+          cover,
+          constraints,
+          finished: finished,
+          placeholder: placeholder,
+        );
+      },
+    );
+  }
+
+  /// Layers of an upright spine (no text). Everything fits the narrow spine:
+  /// the badge and the selection circle are centered and compact.
+  List<Widget> _verticalSpineLayers(
+    ColorScheme scheme,
+    Widget spineCover,
+    _ProgressSummary? summary,
+  ) {
+    final double? fraction = summary?.fraction;
+    return <Widget>[
+      spineCover,
+      _verticalSpineShade,
+      if (fraction != null) _shelfProgressBar(fraction),
+      _statusBadge(scheme, summary, compact: true),
+      _selectionMarks(scheme, compact: true),
+    ];
+  }
+
+  /// Upright spine outside bookshelf mode: a small rounded bar with a soft
+  /// drop shadow.
+  Widget _buildVerticalStackTile(
+    BuildContext context,
+    Widget spineCover,
+    _ProgressSummary? summary,
+  ) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        borderRadius: _verticalSpineRadius,
+        boxShadow: <BoxShadow>[
+          BoxShadow(
+            color: Color(0x59000000),
+            blurRadius: 3,
+            offset: Offset(0, 1.5),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: _verticalSpineRadius,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            ..._verticalSpineLayers(scheme, spineCover, summary),
+            // Ripple sits above everything so it is actually visible.
+            Positioned.fill(
+              child: Material(
+                type: MaterialType.transparency,
+                child: InkWell(
+                  onTap: widget.onTap,
+                  onLongPress: widget.onLongPress,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Upright spine in bookshelf mode: the book stands on the plank drawn by
+  /// [_BookshelfPainter] (cell height == book height + plankBelowBook, the
+  /// same compartment as the 4-per-row grid).
+  Widget _buildShelfVerticalStackTile(
+    BuildContext context,
+    Widget spineCover,
+    _ProgressSummary? summary,
+  ) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Expanded(
+          child: _ShelfBook(
+            onTap: widget.onTap,
+            onLongPress: widget.onLongPress,
+            child: Stack(
+              fit: StackFit.expand,
+              children: _verticalSpineLayers(scheme, spineCover, summary),
+            ),
+          ),
+        ),
+        // Space reserved for the visible shelf plank lip in front of the book
+        const SizedBox(height: _ShelfDims.plankBelowBook),
+      ],
     );
   }
 
@@ -2921,16 +4143,17 @@ class _ShelfDims {
   const _ShelfDims._();
 
   // Plank anatomy (top surface in perspective + front face).
-  static const double plankBehindBook = 7; // surface visible behind a book
+  static const double plankBehindBook = 9; // surface visible behind a book
   static const double plankInFrontOfBook = 5; // surface in front of a book
   static const double plankSurface = plankBehindBook + plankInFrontOfBook;
-  static const double plankFace = 18;
+  static const double plankFace = 17;
   static const double plankHeight = plankSurface + plankFace;
   static const double plankBelowBook = plankInFrontOfBook + plankFace;
-  static const double castShadow = 28; // shadow the plank throws on the wall
+  static const double castShadow = 40; // shadow the plank throws on the wall
   static const double wallBoardWidth = 72;
+  static const double wallSideShadow = 46; // shadow side walls cast on back
 
-  // Grid cells: cover (aspect) + plank + caption.
+  // Grid cells: cover (aspect) + plank.
   static const double gridCoverAspect = 1.45; // cover height / width
   static const double gridBelowCover = plankBelowBook;
 
@@ -2942,6 +4165,46 @@ class _ShelfDims {
   static const double listBookBottom = listTopGap + listBookHeight;
   static const double listRowHeight =
       listBookBottom + plankBelowBook + listBottomGap;
+
+  // Stack mode: one horizontal spine per row. In bookshelf mode the spines
+  // touch (no gap) and form a pile that rests on the bottom plank.
+  static const double stackShelfRowHeight = 52;
+  static const double stackGap = 4; // gap between spines off the shelf
+  static const double stackRowHeight = 50 + stackGap;
+
+  // Bookcase frame: 3 dp outer setback so the top crown cap overhangs like a
+  // real cornice, 12 dp front stile flush with plank front faces, plus 14 dp
+  // recessed inner side wall matching plankSurface for a 45-degree 3D miter.
+  static const double sideInset = 3;
+  static const double sideFrontWidth = 12;
+  static const double sideWallDepth = plankSurface; // 14 dp
+  static const double sideTotalWidth =
+      sideInset + sideFrontWidth + sideWallDepth; // 29 dp
+  static const double sideShadow = 14; // shadow front stile throws on side wall
+  static const double uprightTile = 360; // height of one cached grain tile
+
+  // Uppermost plank / stepped crown cornice above row 0 (content space).
+  static const double crownCap = 7; // overhanging top cap lip
+  static const double crownCove = 7; // tapered cove molding under the cap
+  static const double crownFrieze = 20; // main upper header board
+  static const double crownHeight = crownCap + crownCove + crownFrieze; // 34 dp
+  static const double crownCastShadow = 38; // shadow onto the top compartment
+  static const double crownClearance = 16; // crown bottom -> first book top
+
+  // Lowermost plank / solid apron plinth & feet below the bottom shelf.
+  static const double baseApron = 22; // solid baseboard rail below bottom shelf
+  static const double baseFootHeight = 10; // side stiles extending down as feet
+  static const double baseExtraHeight = baseApron + baseFootHeight; // 32 dp
+  static const double baseTotalHeight = plankHeight + baseExtraHeight; // 63 dp
+  static const double floorMargin = 8; // floor strip below feet on short shelves
+
+  // Clearances the layouts use so covers never touch the frame.
+  static const double shelfTopInset = crownHeight + crownClearance;
+  static const double shelfSideGutter = 7; // plank lip beside the outer books
+  static const double shelfSidePadding = sideTotalWidth + shelfSideGutter;
+  static const double shelfBottomPadding =
+      plankBelowBook + baseExtraHeight + 36; // 90 dp (clears base + FAB)
+  static const double listTopInset = shelfTopInset - listTopGap;
 }
 
 /// Everything needed to lay out (and paint shelves for) one library layout.
@@ -2980,21 +4243,31 @@ class _LibraryLayout {
     return rows * cellHeight + (rows - 1) * mainAxisSpacing + padding.vertical;
   }
 
-  /// Mirrors the previous `maxCrossAxisExtent: 190` / `childAspectRatio: 0.54`
-  /// grid exactly when [bookshelf] is false.
-  factory _LibraryLayout.grid(double width, {required bool bookshelf}) {
+  factory _LibraryLayout.grid(
+      double width, {
+        required bool bookshelf,
+        int columns = 0,
+      }) {
     const double maxCrossAxisExtent = 190;
-    const double crossAxisSpacing = 16;
+    final bool auto = columns < 2;
+    final int fixedCount = columns.clamp(2, 6).toInt();
+    final double crossAxisSpacing = auto
+        ? 16
+        : (fixedCount >= 5 ? 8 : (fixedCount == 4 ? 12 : 16));
     final double mainAxisSpacing = bookshelf ? 14 : 16;
     final EdgeInsets padding = bookshelf
-        ? const EdgeInsets.fromLTRB(22, 24, 22, 96)
+        ? const EdgeInsets.fromLTRB(
+      _ShelfDims.shelfSidePadding,
+      _ShelfDims.shelfTopInset,
+      _ShelfDims.shelfSidePadding,
+      _ShelfDims.shelfBottomPadding,
+    )
         : const EdgeInsets.fromLTRB(16, 16, 16, 96);
 
     final double usable = math.max(0.0, width - padding.horizontal);
-    final int count = math.max(
-      1,
-      (usable / (maxCrossAxisExtent + crossAxisSpacing)).ceil(),
-    );
+    final int count = auto
+        ? math.max(1, (usable / (maxCrossAxisExtent + crossAxisSpacing)).ceil())
+        : fixedCount;
     final double cellWidth =
         math.max(0.0, usable - crossAxisSpacing * (count - 1)) / count;
 
@@ -3006,7 +4279,9 @@ class _LibraryLayout {
     return _LibraryLayout(
       padding: padding,
       cellHeight: cellHeight,
-      bookBottom: bookshelf ? coverHeight : cellHeight,
+      bookBottom: bookshelf
+          ? cellHeight - _ShelfDims.plankBelowBook
+          : cellHeight,
       crossAxisCount: count,
       cellWidth: cellWidth,
       crossAxisSpacing: crossAxisSpacing,
@@ -3017,7 +4292,12 @@ class _LibraryLayout {
   factory _LibraryLayout.list({required bool bookshelf}) {
     if (bookshelf) {
       return const _LibraryLayout(
-        padding: EdgeInsets.fromLTRB(16, 8, 16, 96),
+        padding: EdgeInsets.fromLTRB(
+          _ShelfDims.shelfSidePadding,
+          _ShelfDims.listTopInset,
+          _ShelfDims.shelfSidePadding,
+          _ShelfDims.shelfBottomPadding,
+        ),
         cellHeight: _ShelfDims.listRowHeight,
         bookBottom: _ShelfDims.listBookBottom,
       );
@@ -3028,12 +4308,71 @@ class _LibraryLayout {
       bookBottom: 112,
     );
   }
+
+  /// Upright spines on shelves. The shelf (padding, row height, plank spacing,
+  /// where the books touch the plank) is exactly the 4-comics-per-row grid's;
+  /// only the number of books per row changes: as many ~38 dp spines as fit.
+  factory _LibraryLayout.verticalStack(
+    double width, {
+    required bool bookshelf,
+  }) {
+    final _LibraryLayout ref4 = _LibraryLayout.grid(
+      width,
+      bookshelf: bookshelf,
+      columns: 4,
+    );
+
+    const double targetSpineWidth = 38.0;
+    const double spineSpacing = 2.0;
+    final double usable = math.max(0.0, width - ref4.padding.horizontal);
+    final int crossAxisCount = math.max(
+      1,
+      ((usable + spineSpacing) / (targetSpineWidth + spineSpacing)).floor(),
+    );
+    final double cellWidth =
+        math.max(0.0, usable - spineSpacing * (crossAxisCount - 1)) /
+        crossAxisCount;
+
+    return _LibraryLayout(
+      padding: ref4.padding,
+      cellHeight: ref4.cellHeight,
+      bookBottom: ref4.bookBottom,
+      crossAxisCount: crossAxisCount,
+      cellWidth: cellWidth,
+      crossAxisSpacing: spineSpacing,
+      mainAxisSpacing: ref4.mainAxisSpacing,
+    );
+  }
+
+  /// One spine per row. On a shelf the rows touch, so the last row's bottom
+  /// (== [bookBottom] of that row) is where the pile meets the bottom plank.
+  factory _LibraryLayout.stack({required bool bookshelf}) {
+    if (bookshelf) {
+      return const _LibraryLayout(
+        padding: EdgeInsets.fromLTRB(
+          _ShelfDims.shelfSidePadding,
+          _ShelfDims.shelfTopInset,
+          _ShelfDims.shelfSidePadding,
+          _ShelfDims.shelfBottomPadding,
+        ),
+        cellHeight: _ShelfDims.stackShelfRowHeight,
+        bookBottom: _ShelfDims.stackShelfRowHeight,
+      );
+    }
+    return const _LibraryLayout(
+      padding: EdgeInsets.fromLTRB(12, 8, 12, 96),
+      cellHeight: _ShelfDims.stackRowHeight,
+      bookBottom: _ShelfDims.stackRowHeight,
+    );
+  }
 }
 
 /// Colors for the shelf. Two fixed palettes (identity-comparable so the
 /// painter can cheaply decide when to repaint).
 class _ShelfPalette {
   const _ShelfPalette({
+    required this.surround,
+    required this.floor,
     required this.wall,
     required this.wallSeam,
     required this.wallSeamLight,
@@ -3046,6 +4385,8 @@ class _ShelfPalette {
     required this.grainLight,
   });
 
+  final Color surround;
+  final Color floor;
   final Color wall;
   final Color wallSeam;
   final Color wallSeamLight;
@@ -3057,45 +4398,40 @@ class _ShelfPalette {
   final Color grainDark;
   final Color grainLight;
 
-  /// Dark walnut on a deep, warm back panel: sits quietly in the dark theme.
+  /// Dark walnut with a lifted backing panel so downward plank shadows and
+  /// inward side-wall shadows read with strong 3D depth.
   static const _ShelfPalette dark = _ShelfPalette(
-    wall: Color(0xFF17120F),
-    wallSeam: Color(0x66000000),
-    wallSeamLight: Color(0x0DFFFFFF),
-    surfaceBack: Color(0xFF4A2F1B),
-    surfaceFront: Color(0xFF6E4A2E),
-    faceTop: Color(0xFF603F26),
-    faceBottom: Color(0xFF36230F),
-    highlight: Color(0xFF9A6E48),
-    grainDark: Color(0x4D1E0F05),
-    grainLight: Color(0x26FFD9A8),
+    surround: Color(0xFF140E0A),
+    floor: Color(0xFF1A120D),
+    wall: Color(0xFF2B1D14),
+    wallSeam: Color(0x4D000000),
+    wallSeamLight: Color(0x0AFFFFFF),
+    surfaceBack: Color(0xFF2E1C10),
+    surfaceFront: Color(0xFF563822),
+    faceTop: Color(0xFF6B472C),
+    faceBottom: Color(0xFF3A2413),
+    highlight: Color(0xFFA67952),
+    grainDark: Color(0x521A0C04),
+    grainLight: Color(0x24FFD9A8),
   );
 
   /// Lighter oak for light themes.
   static const _ShelfPalette light = _ShelfPalette(
-    wall: Color(0xFFD8CCBD),
-    wallSeam: Color(0x33000000),
-    wallSeamLight: Color(0x33FFFFFF),
-    surfaceBack: Color(0xFFB58858),
-    surfaceFront: Color(0xFFD2A877),
-    faceTop: Color(0xFFC39563),
-    faceBottom: Color(0xFF9B6D42),
-    highlight: Color(0xFFEBD2AA),
+    surround: Color(0xFFE8E2DA),
+    floor: Color(0xFFDFD7CD),
+    wall: Color(0xFFD5C7B6),
+    wallSeam: Color(0x2E000000),
+    wallSeamLight: Color(0x2EFFFFFF),
+    surfaceBack: Color(0xFF946B43),
+    surfaceFront: Color(0xFFC49868),
+    faceTop: Color(0xFFCCA070),
+    faceBottom: Color(0xFF96693E),
+    highlight: Color(0xFFF2DCBA),
     grainDark: Color(0x40502C10),
-    grainLight: Color(0x40FFF0D0),
+    grainLight: Color(0x38FFF0D0),
   );
 }
 
-/// The bookcase behind the scroll view, split into two retained layers so a
-/// scroll tick only ever repaints the part that really moves:
-///
-///  1. [_ShelfWallPainter] - back panel, seams and side shading. It is fixed to
-///     the viewport and independent of the scroll offset, so it is painted once
-///     per size/theme and afterwards only composited.
-///  2. [_BookshelfPainter] - the planks and the shadows they cast. It follows
-///     the scroll controller and draws only the visible planks, reusing the
-///     cached paints, shaders and grain paths of a [_PlankKit] instead of
-///     rebuilding them every frame.
 class _ShelfBackdrop extends StatelessWidget {
   const _ShelfBackdrop({
     required this.scroll,
@@ -3104,6 +4440,7 @@ class _ShelfBackdrop extends StatelessWidget {
     required this.topInset,
     required this.rowStride,
     required this.bookBottom,
+    this.drawIntermediateShelves = true,
   });
 
   final ScrollController scroll;
@@ -3113,20 +4450,24 @@ class _ShelfBackdrop extends StatelessWidget {
   final double rowStride;
   final double bookBottom;
 
+  /// `false` in stack mode: the books form one pile on the bottom plank, so
+  /// no plank is drawn between rows (back wall, uprights, crown and base
+  /// still are).
+  final bool drawIntermediateShelves;
+
   @override
   Widget build(BuildContext context) {
     return Stack(
       fit: StackFit.expand,
       children: <Widget>[
-        // Layer 1: static wall. No repaint listenable, so after its first paint
-        // it is never re-recorded while the library scrolls.
+        // Layer 1: static back panel & board seams.
         RepaintBoundary(
           child: CustomPaint(
             isComplex: true,
             painter: _ShelfWallPainter(palette: palette),
           ),
         ),
-        // Layer 2: only the planks move with the scroll offset.
+        // Layer 2: uprights, crown, planks, and lowermost base plinth.
         RepaintBoundary(
           child: CustomPaint(
             willChange: true,
@@ -3137,6 +4478,7 @@ class _ShelfBackdrop extends StatelessWidget {
               topInset: topInset,
               rowStride: rowStride,
               bookBottom: bookBottom,
+              drawIntermediateShelves: drawIntermediateShelves,
             ),
           ),
         ),
@@ -3145,8 +4487,8 @@ class _ShelfBackdrop extends StatelessWidget {
   }
 }
 
-/// Back panel of the bookcase. Viewport-fixed, so it never listens to the
-/// scroll controller; it repaints only when the size or the palette changes.
+/// Static back panel of the bookcase. Viewport-fixed, so it never listens to
+/// the scroll controller; it repaints only when the size or palette changes.
 class _ShelfWallPainter extends CustomPainter {
   const _ShelfWallPainter({required this.palette});
 
@@ -3154,9 +4496,16 @@ class _ShelfWallPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    canvas.drawRect(Offset.zero & size, Paint()..color = palette.wall);
+    canvas.drawRect(Offset.zero & size, Paint()..color = palette.surround);
 
-    // Vertical back-board seams.
+    final double wallLeft = _ShelfDims.sideTotalWidth;
+    final double wallRight = math.max(wallLeft, size.width - wallLeft);
+    canvas.drawRect(
+      Rect.fromLTRB(wallLeft, 0, wallRight, size.height),
+      Paint()..color = palette.wall,
+    );
+
+    // Subtle vertical back-board seams inside the compartment area.
     final Paint seam = Paint()
       ..color = palette.wallSeam
       ..strokeWidth = 1;
@@ -3164,46 +4513,22 @@ class _ShelfWallPainter extends CustomPainter {
       ..color = palette.wallSeamLight
       ..strokeWidth = 1;
     for (
-      double x = _ShelfDims.wallBoardWidth;
-      x < size.width;
-      x += _ShelfDims.wallBoardWidth
+    double x = wallLeft + _ShelfDims.wallBoardWidth;
+    x < wallRight;
+    x += _ShelfDims.wallBoardWidth
     ) {
       canvas.drawLine(Offset(x, 0), Offset(x, size.height), seam);
       canvas.drawLine(Offset(x + 1, 0), Offset(x + 1, size.height), seamLight);
     }
 
-    // Soft inner shading toward the left and right edges.
-    const double side = 30;
-    final Rect left = Rect.fromLTWH(0, 0, side, size.height);
-    final Rect right = Rect.fromLTWH(size.width - side, 0, side, size.height);
-    canvas.drawRect(
-      left,
-      Paint()
-        ..shader = LinearGradient(
-          colors: [Colors.black.withAlpha(110), Colors.black.withAlpha(0)],
-        ).createShader(left),
-    );
-    canvas.drawRect(
-      right,
-      Paint()
-        ..shader = LinearGradient(
-          colors: [Colors.black.withAlpha(0), Colors.black.withAlpha(110)],
-        ).createShader(right),
-    );
+    // Inward side-wall shadows onto the back panel.
+    _PlankKit.obtain(palette, size.width).paintWallSideShadows(canvas, size);
   }
 
   @override
   bool shouldRepaint(covariant _ShelfWallPainter old) => old.palette != palette;
 }
 
-/// Paints a wooden plank under every visible row (plus empty shelves to fill
-/// the screen when the library is short) and the shadows each plank casts. It
-/// follows [scroll] directly, so it stays glued to the rows while scrolling and
-/// only the visible planks are ever drawn, no matter how large the library is.
-///
-/// Per frame this does no allocation-heavy work: every gradient shader, stroke
-/// paint and grain path lives in the shared [_PlankKit], and a plank is drawn
-/// by translating the canvas to its row and replaying 12 cheap operations.
 class _BookshelfPainter extends CustomPainter {
   _BookshelfPainter({
     required this.scroll,
@@ -3213,6 +4538,7 @@ class _BookshelfPainter extends CustomPainter {
     required this.rowStride,
     required this.bookBottom,
     this.fillEmptyShelves = true,
+    this.drawIntermediateShelves = true,
   }) : super(repaint: scroll);
 
   final ScrollController scroll;
@@ -3222,6 +4548,9 @@ class _BookshelfPainter extends CustomPainter {
   final double rowStride;
   final double bookBottom;
   final bool fillEmptyShelves;
+
+  /// When `false` (stack mode) only the bottom plank is drawn under the books.
+  final bool drawIntermediateShelves;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -3236,13 +4565,82 @@ class _BookshelfPainter extends CustomPainter {
     final double firstTop = topInset + bookBottom - _ShelfDims.plankBehindBook;
     final double reach = _ShelfDims.plankHeight + _ShelfDims.castShadow;
 
-    int first = ((offset - firstTop - reach) / rowStride).floor();
-    int last = ((offset + size.height - firstTop) / rowStride).ceil();
-    first = math.max(first, 0);
-    if (!fillEmptyShelves) last = math.min(last, rowCount - 1);
+    // Where the lowermost plank & base plinth sit in content space:
+    // - On a short library, docked cleanly at the bottom of the screen with
+    //   empty shelves filling the space above it.
+    // - On a tall library, anchored directly under the final row of comics.
+    final int lastContentRow = math.max(0, rowCount - 1);
+    final double lastContentShelfTop = firstTop + lastContentRow * rowStride;
+    final double viewportBaseTop =
+        size.height - _ShelfDims.baseTotalHeight - _ShelfDims.floorMargin;
+    // A pile rests on its own bottom plank, so it never docks to the screen
+    // bottom (that would leave the books floating above the plank).
+    final bool dockBaseToBottom =
+        fillEmptyShelves &&
+        drawIntermediateShelves &&
+        lastContentShelfTop < viewportBaseTop;
+    final double basePlankTop =
+    dockBaseToBottom ? viewportBaseTop : lastContentShelfTop;
 
-    for (int i = first; i <= last; i++) {
-      kit.paint(canvas, firstTop + i * rowStride - offset, i);
+    final double crownTop = -offset;
+    final double baseScreenTop = basePlankTop - offset;
+    final double bookcaseTop = math.max(
+      0.0,
+      crownTop + _ShelfDims.crownCap + _ShelfDims.crownCove,
+    );
+    final double bookcaseBottom = math.min(
+      size.height,
+      baseScreenTop + _ShelfDims.baseTotalHeight,
+    );
+
+    // Mask overscroll above the crown or space below the bookcase feet.
+    if (crownTop > 0) {
+      kit.paintSurroundBand(canvas, 0.0, crownTop);
+    }
+    if (baseScreenTop + _ShelfDims.baseTotalHeight < size.height) {
+      kit.paintFloorArea(
+        canvas,
+        math.max(0.0, baseScreenTop + _ShelfDims.baseTotalHeight),
+        size.height,
+      );
+    }
+
+    // Side uprights spanning cleanly between the crown and the base feet.
+    kit.paintUprights(
+      canvas,
+      size.width,
+      top: bookcaseTop,
+      bottom: bookcaseBottom,
+    );
+
+    // Intermediate shelves (skipped in stack mode: the books are one pile).
+    if (drawIntermediateShelves) {
+      int first = ((offset - firstTop - reach) / rowStride).floor();
+      int last = ((offset + size.height - firstTop) / rowStride).ceil();
+      first = math.max(first, 0);
+      if (!fillEmptyShelves) last = math.min(last, rowCount - 1);
+
+      for (int i = first; i <= last; i++) {
+        final double shelfContentTop = firstTop + i * rowStride;
+        // Stop before the lowermost plank so it never collides with an empty shelf.
+        if (shelfContentTop >= basePlankTop - 24) break;
+        kit.paint(canvas, shelfContentTop - offset, i);
+      }
+    }
+
+    // Lowermost plank + apron plinth + side feet.
+    if (baseScreenTop < size.height &&
+        baseScreenTop + _ShelfDims.baseTotalHeight > 0) {
+      kit.paintBase(
+        canvas,
+        baseScreenTop,
+        dockBaseToBottom ? 99 : lastContentRow,
+      );
+    }
+
+    // Uppermost plank / stepped crown cornice.
+    if (crownTop + _ShelfDims.crownHeight + _ShelfDims.crownCastShadow > 0) {
+      kit.paintCrown(canvas, crownTop);
     }
   }
 
@@ -3254,7 +4652,8 @@ class _BookshelfPainter extends CustomPainter {
         old.topInset != topInset ||
         old.rowStride != rowStride ||
         old.bookBottom != bookBottom ||
-        old.fillEmptyShelves != fillEmptyShelves;
+        old.fillEmptyShelves != fillEmptyShelves ||
+        old.drawIntermediateShelves != drawIntermediateShelves;
   }
 }
 
@@ -3274,44 +4673,95 @@ class _PlankGrain {
   final _GrainPaths face;
 }
 
-/// Everything a plank needs that does not change from frame to frame: the
-/// gradient shaders (built once for a plank whose top edge sits at y = 0),
-/// the stroke paints and a handful of grain variants.
-///
-/// A plank is drawn after `canvas.translate(0, top)`: shader coordinates follow
-/// the canvas transform, so the same shaders serve every row and every frame.
-/// The kit is rebuilt only when the width or the palette changes (rotation,
-/// theme switch). A single shared entry is enough: the grid and the list share
-/// one library width, and only one theme is active at a time.
+/// Precomputed shaders, geometry paths, and wood-grain strokes for the bookcase.
+/// Built once per (palette, width) pair so scrolling allocates zero objects.
 class _PlankKit {
-  _PlankKit._(this.palette, this.width) {
+  _PlankKit._(this.palette, this.width)
+      : frontLeft = _ShelfDims.sideInset + _ShelfDims.sideFrontWidth,
+        backLeft = _ShelfDims.sideTotalWidth,
+        frontWidth = math.max(
+          8.0,
+          width - 2 * (_ShelfDims.sideInset + _ShelfDims.sideFrontWidth),
+        ),
+        backWidth = math.max(8.0, width - 2 * _ShelfDims.sideTotalWidth),
+        hasRoom = width - 2 * _ShelfDims.sideTotalWidth > 8 {
     const double surfaceH = _ShelfDims.plankSurface;
     const double faceH = _ShelfDims.plankFace;
-    final double w = width;
+    const double depth = _ShelfDims.sideWallDepth;
+    final double fw = frontWidth;
 
-    surfaceRect = Rect.fromLTWH(0, 0, w, surfaceH);
-    faceRect = Rect.fromLTWH(0, surfaceH, w, faceH);
-    wholeRect = Rect.fromLTWH(0, 0, w, surfaceH + faceH);
-    shadowRect = Rect.fromLTWH(0, surfaceH + faceH, w, _ShelfDims.castShadow);
-    occlusionRect = Rect.fromLTWH(0, 0, w, 5);
-    highlightRect = Rect.fromLTWH(0, surfaceH, w, 1.5);
-    edgeRect = Rect.fromLTWH(0, surfaceH + faceH - 2, w, 2);
-    sheenRect = Rect.fromLTWH(0, surfaceH + 3, w, 3);
+    // Local coordinates where x = 0 is the inner edge of the left front stile
+    // and x = fw is the inner edge of the right front stile.
+    surfaceRect = Rect.fromLTWH(0, 0, fw, surfaceH);
+    faceRect = Rect.fromLTWH(0, surfaceH, fw, faceH);
+    wholeRect = Rect.fromLTWH(0, 0, fw, surfaceH + faceH);
 
-    // 1. Shadow thrown on the back panel below the plank.
+    // Trapezoidal flat shelf surface: recedes inward by [depth] at y = 0 so
+    // it meets the angled inner side walls at a true 45-degree 3D miter.
+    surfacePath = Path()
+      ..moveTo(depth, 0)
+      ..lineTo(fw - depth, 0)
+      ..lineTo(fw, surfaceH)
+      ..lineTo(0, surfaceH)
+      ..close();
+
+    // Downward cast shadow on the back panel (between the rear corners).
+    shadowRect = Rect.fromLTWH(
+      depth,
+      surfaceH + faceH,
+      backWidth,
+      _ShelfDims.castShadow,
+    );
+
+    // Side-wall cast shadows right below where each shelf joins the uprights.
+    sideJointShadowLeft = Path()
+      ..moveTo(0, surfaceH + faceH)
+      ..lineTo(depth, surfaceH + faceH)
+      ..lineTo(depth, surfaceH + faceH + _ShelfDims.castShadow * 0.72)
+      ..lineTo(0, surfaceH + faceH + _ShelfDims.castShadow * 0.35)
+      ..close();
+    sideJointShadowRight = Path()
+      ..moveTo(fw - depth, surfaceH + faceH)
+      ..lineTo(fw, surfaceH + faceH)
+      ..lineTo(fw, surfaceH + faceH + _ShelfDims.castShadow * 0.35)
+      ..lineTo(fw - depth, surfaceH + faceH + _ShelfDims.castShadow * 0.72)
+      ..close();
+
+    occlusionRect = Rect.fromLTWH(0, 0, fw, surfaceH);
+    surfaceSideShadowRect = Rect.fromLTWH(0, 0, fw, surfaceH);
+    highlightRect = Rect.fromLTWH(0, surfaceH, fw, 1.5);
+    edgeRect = Rect.fromLTWH(0, surfaceH + faceH - 2, fw, 2);
+    sheenRect = Rect.fromLTWH(0, surfaceH + 3, fw, 3);
+
+    // 1. Deep cast shadow thrown onto the back panel beneath the plank.
     shadowPaint = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topCenter,
         end: Alignment.bottomCenter,
         colors: [
-          Colors.black.withAlpha(160),
+          Colors.black.withAlpha(215),
+          Colors.black.withAlpha(115),
+          Colors.black.withAlpha(35),
+          Colors.black.withAlpha(0),
+        ],
+        stops: const [0.0, 0.32, 0.68, 1.0],
+      ).createShader(shadowRect);
+
+    sideJointShadowPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          Colors.black.withAlpha(185),
           Colors.black.withAlpha(55),
           Colors.black.withAlpha(0),
         ],
-        stops: const [0.0, 0.4, 1.0],
-      ).createShader(shadowRect);
+        stops: const [0.0, 0.5, 1.0],
+      ).createShader(
+        Rect.fromLTWH(0, surfaceH + faceH, fw, _ShelfDims.castShadow * 0.75),
+      );
 
-    // 2. Top surface (lighter toward the front edge).
+    // 2. Flat top surface base wood (darkened in the back where books sit).
     surfacePaint = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topCenter,
@@ -3319,15 +4769,34 @@ class _PlankKit {
         colors: [palette.surfaceBack, palette.surfaceFront],
       ).createShader(surfaceRect);
 
-    // Dark contact line where the surface meets the back panel.
+    // Full-depth ambient occlusion across the flat shelf surface.
     occlusionPaint = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topCenter,
         end: Alignment.bottomCenter,
-        colors: [Colors.black.withAlpha(120), Colors.black.withAlpha(0)],
+        colors: [
+          Colors.black.withAlpha(180),
+          Colors.black.withAlpha(85),
+          Colors.black.withAlpha(15),
+        ],
+        stops: const [0.0, 0.55, 1.0],
       ).createShader(occlusionRect);
 
-    // 3. Front face, bevel highlight and lower edge shade.
+    // Side-wall shadow falling onto the left/right ends of the shelf surface.
+    surfaceSideShadowPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Colors.black.withAlpha(155),
+          Colors.black.withAlpha(45),
+          Colors.black.withAlpha(0),
+          Colors.black.withAlpha(0),
+          Colors.black.withAlpha(45),
+          Colors.black.withAlpha(155),
+        ],
+        stops: const [0.0, 0.05, 0.14, 0.86, 0.95, 1.0],
+      ).createShader(surfaceSideShadowRect);
+
+    // 3. Front vertical face, crisp top bevel highlight, and bottom edge.
     facePaint = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topCenter,
@@ -3335,30 +4804,33 @@ class _PlankKit {
         colors: [palette.faceTop, palette.faceBottom],
       ).createShader(faceRect);
     highlightPaint = Paint()..color = palette.highlight;
-    edgePaint = Paint()..color = Colors.black.withAlpha(130);
+    edgePaint = Paint()..color = Colors.black.withAlpha(165);
 
-    // 4. Polished sheen: a soft specular streak along the front lip.
+    // 4. Soft specular sheen along the front lip.
     sheenPaint = Paint()
       ..shader = LinearGradient(
         colors: [
           Colors.white.withAlpha(0),
-          Colors.white.withAlpha(46),
+          Colors.white.withAlpha(42),
           Colors.white.withAlpha(0),
         ],
         stops: const [0.0, 0.5, 1.0],
       ).createShader(sheenRect);
 
-    // 5. Slight darkening toward both ends of the plank.
+    // 5. Subtle corner darkening where the front face meets the front stiles.
     endsPaint = Paint()
       ..shader = LinearGradient(
         colors: [
-          Colors.black.withAlpha(90),
+          Colors.black.withAlpha(85),
           Colors.black.withAlpha(0),
           Colors.black.withAlpha(0),
-          Colors.black.withAlpha(90),
+          Colors.black.withAlpha(85),
         ],
-        stops: const [0.0, 0.05, 0.95, 1.0],
-      ).createShader(wholeRect);
+        stops: const [0.0, 0.03, 0.97, 1.0],
+      ).createShader(faceRect);
+
+    surroundPaint = Paint()..color = palette.surround;
+    floorPaint = Paint()..color = palette.floor;
 
     grainDarkPaint = Paint()
       ..style = PaintingStyle.stroke
@@ -3372,16 +4844,25 @@ class _PlankKit {
     grains = List<_PlankGrain>.generate(_variantCount, (int v) {
       final math.Random rnd = math.Random(v * 7919 + 101);
       return _PlankGrain(
-        _buildGrain(surfaceRect, rnd, math.max(8, (w / 26).round())),
-        _buildGrain(faceRect, rnd, math.max(10, (w / 16).round())),
+        _buildGrain(surfaceRect, rnd, math.max(8, (fw / 26).round())),
+        _buildGrain(faceRect, rnd, math.max(10, (fw / 16).round())),
       );
     }, growable: false);
+
+    _buildUprights();
+    _buildCrown();
+    _buildBase();
   }
 
-  /// Distinct grain patterns. Rows pick one by index (stride 5 mod 8 scrambles
-  /// the order), so neighbouring planks never look alike.
-  static const int _variantCount = 8;
+  /// Front faces start at [frontLeft] (inner edge of the front stile); rear
+  /// edges start at [backLeft] (where the recessed side wall meets the back).
+  final double frontLeft;
+  final double backLeft;
+  final double frontWidth;
+  final double backWidth;
+  final bool hasRoom;
 
+  static const int _variantCount = 8;
   static _PlankKit? _current;
 
   static _PlankKit obtain(_ShelfPalette palette, double width) {
@@ -3400,26 +4881,90 @@ class _PlankKit {
   late final Rect wholeRect;
   late final Rect shadowRect;
   late final Rect occlusionRect;
+  late final Rect surfaceSideShadowRect;
   late final Rect highlightRect;
   late final Rect edgeRect;
   late final Rect sheenRect;
+  late final Path surfacePath;
+  late final Path sideJointShadowLeft;
+  late final Path sideJointShadowRight;
 
   late final Paint shadowPaint;
+  late final Paint sideJointShadowPaint;
   late final Paint surfacePaint;
   late final Paint occlusionPaint;
+  late final Paint surfaceSideShadowPaint;
   late final Paint facePaint;
   late final Paint highlightPaint;
   late final Paint edgePaint;
   late final Paint sheenPaint;
   late final Paint endsPaint;
+  late final Paint surroundPaint;
+  late final Paint floorPaint;
   late final Paint grainDarkPaint;
   late final Paint grainLightPaint;
 
   late final List<_PlankGrain> grains;
 
-  /// Long, slightly drifting streaks in [r]'s local coordinates. Every streak
-  /// is kept inside [r] (the inset covers the curve's drift plus half the
-  /// stroke width), so no per-plank clipRect is needed at draw time.
+  // --- side uprights & back-wall side shadows ------------------------------
+  late final Rect stileRect;
+  late final Rect stripRect;
+  late final Rect stileShadowRect;
+  late final Rect stripSeamRect;
+  late final Rect stileBevelRect;
+  late final Rect stileEdgeRect;
+  late final Rect stileSheenRect;
+  late final Rect wallSideShadowRect;
+  late final Paint stilePaint;
+  late final Paint stripPaint;
+  late final Paint stileShadowPaint;
+  late final Paint stripSeamPaint;
+  late final Paint stileSheenPaint;
+  late final Paint wallSideShadowPaint;
+  late final _GrainPaths stileGrain;
+  late final _GrainPaths stripGrain;
+
+  // --- uppermost plank / stepped crown cornice -----------------------------
+  late final Rect crownCapRect;
+  late final Rect crownCapHighlightRect;
+  late final Rect crownCapUnderShadowRect;
+  late final Rect crownCoveBounds;
+  late final Path crownCovePath;
+  late final Rect crownFriezeRect;
+  late final Rect crownFriezeTopShadowRect;
+  late final Rect crownBeadRect;
+  late final Rect crownEdgeRect;
+  late final Rect crownShadowRect;
+  late final Path crownSideShadowLeft;
+  late final Path crownSideShadowRight;
+  late final Paint crownCapPaint;
+  late final Paint crownCapUnderShadowPaint;
+  late final Paint crownCovePaint;
+  late final Paint crownFriezePaint;
+  late final Paint crownFriezeTopShadowPaint;
+  late final Paint crownEndsPaint;
+  late final Paint crownShadowPaint;
+  late final Paint crownSideShadowPaint;
+  late final Paint crownJointPaint;
+  late final Paint crownJointLightPaint;
+  late final Path crownJoints;
+  late final Path crownJointsLight;
+  late final _GrainPaths crownCapGrain;
+  late final _GrainPaths crownFriezeGrain;
+
+  // --- lowermost plank / base plinth & feet --------------------------------
+  late final Rect baseApronRect;
+  late final Rect baseApronTopShadowRect;
+  late final Rect baseApronBottomEdgeRect;
+  late final Rect baseKickVoidRect;
+  late final Rect baseFloorShadowRect;
+  late final Paint baseApronPaint;
+  late final Paint baseApronTopShadowPaint;
+  late final Paint baseApronEndsPaint;
+  late final Paint baseKickVoidPaint;
+  late final Paint baseFloorShadowPaint;
+  late final _GrainPaths baseApronGrain;
+
   static _GrainPaths _buildGrain(Rect r, math.Random rnd, int count) {
     const double inset = 1.2;
     final double usableHeight = math.max(r.height - 2 * inset, 0.0);
@@ -3427,8 +4972,12 @@ class _PlankKit {
     final Path light = Path();
     for (int k = 0; k < count; k++) {
       final double y = r.top + inset + rnd.nextDouble() * usableHeight;
-      final double length = math.min(50 + rnd.nextDouble() * r.width * 0.5, r.width);
-      final double x0 = r.left + rnd.nextDouble() * math.max(r.width - length, 0.0);
+      final double length = math.min(
+        50 + rnd.nextDouble() * r.width * 0.5,
+        r.width,
+      );
+      final double x0 =
+          r.left + rnd.nextDouble() * math.max(r.width - length, 0.0);
       final double drift = (rnd.nextDouble() - 0.5) * 2.5;
       final Path target = k.isEven ? dark : light;
       target.moveTo(x0, y);
@@ -3437,25 +4986,564 @@ class _PlankKit {
     return _GrainPaths(dark, light);
   }
 
-  /// Draws the plank whose top edge is at [top] (canvas coordinates). The order
-  /// matches the original painter: shadow, surface + grain, contact line, face
-  /// + grain, highlight, lower edge, sheen, end darkening.
-  void paint(Canvas canvas, double top, int index) {
-    final _PlankGrain grain = grains[(index * 5) % _variantCount];
+  static _GrainPaths _buildVerticalGrain(Rect r, math.Random rnd, int count) {
+    const double inset = 1.0;
+    final double usableWidth = math.max(r.width - 2 * inset, 0.0);
+    final Path dark = Path();
+    final Path light = Path();
+    for (int k = 0; k < count; k++) {
+      final double x = r.left + inset + rnd.nextDouble() * usableWidth;
+      final double length = math.min(
+        60 + rnd.nextDouble() * r.height * 0.5,
+        r.height,
+      );
+      final double y0 =
+          r.top + rnd.nextDouble() * math.max(r.height - length, 0.0);
+      final double drift = (rnd.nextDouble() - 0.5) * 1.6;
+      final Path target = k.isEven ? dark : light;
+      target.moveTo(x, y0);
+      target.quadraticBezierTo(x + drift, y0 + length / 2, x, y0 + length);
+    }
+    return _GrainPaths(dark, light);
+  }
+
+  void _buildUprights() {
+    const double inset = _ShelfDims.sideInset;
+    const double front = _ShelfDims.sideFrontWidth;
+    const double depth = _ShelfDims.sideWallDepth;
+    const double total = _ShelfDims.sideTotalWidth;
+    const double tile = _ShelfDims.uprightTile;
+
+    stileRect = Rect.fromLTWH(inset, 0, front, tile);
+    stripRect = Rect.fromLTWH(inset + front, 0, depth, tile);
+    stileShadowRect = Rect.fromLTWH(
+      inset + front,
+      0,
+      _ShelfDims.sideShadow,
+      tile,
+    );
+    stripSeamRect = Rect.fromLTWH(total - 1, 0, 1, tile);
+    stileBevelRect = Rect.fromLTWH(inset + front - 1.5, 0, 1.5, tile);
+    stileEdgeRect = Rect.fromLTWH(inset, 0, 1.2, tile);
+    stileSheenRect = Rect.fromLTWH(inset + 3, 0, 3.5, tile);
+    wallSideShadowRect = Rect.fromLTWH(
+      total,
+      0,
+      _ShelfDims.wallSideShadow,
+      tile,
+    );
+
+    // Recessed inner side wall: lit near the front stile, deep shadow at back.
+    stripPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Color.lerp(palette.surfaceFront, Colors.black, 0.15)!,
+          Color.lerp(palette.surfaceBack, Colors.black, 0.55)!,
+        ],
+      ).createShader(stripRect);
+    stripSeamPaint = Paint()..color = Colors.black.withAlpha(160);
+
+    // Shadow cast onto the back panel by the left and right bookcase walls.
+    wallSideShadowPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Colors.black.withAlpha(175),
+          Colors.black.withAlpha(80),
+          Colors.black.withAlpha(20),
+          Colors.black.withAlpha(0),
+        ],
+        stops: const [0.0, 0.35, 0.72, 1.0],
+      ).createShader(wallSideShadowRect);
+
+    stileShadowPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Colors.black.withAlpha(160),
+          Colors.black.withAlpha(55),
+          Colors.black.withAlpha(0),
+        ],
+        stops: const [0.0, 0.45, 1.0],
+      ).createShader(stileShadowRect);
+
+    stilePaint = Paint()
+      ..shader = LinearGradient(
+        colors: [palette.faceBottom, palette.faceTop, palette.surfaceFront],
+        stops: const [0.0, 0.45, 1.0],
+      ).createShader(stileRect);
+    stileSheenPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Colors.white.withAlpha(0),
+          Colors.white.withAlpha(46),
+          Colors.white.withAlpha(0),
+        ],
+        stops: const [0.0, 0.5, 1.0],
+      ).createShader(stileSheenRect);
+
+    final math.Random rnd = math.Random(60013);
+    stileGrain = _buildVerticalGrain(stileRect, rnd, 16);
+    stripGrain = _buildVerticalGrain(stripRect, rnd, 10);
+  }
+
+  void _buildCrown() {
+    const double capH = _ShelfDims.crownCap;
+    const double coveH = _ShelfDims.crownCove;
+    const double friezeH = _ShelfDims.crownFrieze;
+    const double h = _ShelfDims.crownHeight;
+    const double inset = _ShelfDims.sideInset;
+    const double front = _ShelfDims.sideFrontWidth;
+    const double depth = _ShelfDims.sideWallDepth;
+    final double w = width;
+    final double stileInnerL = inset + front;
+    final double stileInnerR = w - inset - front;
+
+    // 1. Overhanging top cap lip (full width).
+    crownCapRect = Rect.fromLTWH(0, 0, w, capH);
+    crownCapHighlightRect = Rect.fromLTWH(0, 0, w, 1.5);
+    crownCapUnderShadowRect = Rect.fromLTWH(0, capH - 1.5, w, 1.5);
+
+    // 2. Tapered cove molding stepping inward from cap to header board.
+    crownCoveBounds = Rect.fromLTWH(0, capH, w, coveH);
+    crownCovePath = Path()
+      ..moveTo(0, capH)
+      ..lineTo(w, capH)
+      ..lineTo(w - inset, capH + coveH)
+      ..lineTo(inset, capH + coveH)
+      ..close();
+
+    // 3. Upper header board / frieze spanning between the outer stile edges.
+    crownFriezeRect = Rect.fromLTWH(
+      inset,
+      capH + coveH,
+      math.max(w - 2 * inset, 1.0),
+      friezeH,
+    );
+    crownFriezeTopShadowRect = Rect.fromLTWH(
+      inset,
+      capH + coveH,
+      math.max(w - 2 * inset, 1.0),
+      4.0,
+    );
+    crownBeadRect = Rect.fromLTWH(
+      inset,
+      h - 3.0,
+      math.max(w - 2 * inset, 1.0),
+      1.2,
+    );
+    crownEdgeRect = Rect.fromLTWH(
+      inset,
+      h - 1.8,
+      math.max(w - 2 * inset, 1.0),
+      1.8,
+    );
+
+    // 4. Cast shadows into the top compartment (back wall + recessed side walls).
+    crownShadowRect = Rect.fromLTWH(
+      backLeft,
+      h,
+      backWidth,
+      _ShelfDims.crownCastShadow,
+    );
+    crownSideShadowLeft = Path()
+      ..moveTo(stileInnerL, h)
+      ..lineTo(stileInnerL + depth, h)
+      ..lineTo(stileInnerL + depth, h + _ShelfDims.crownCastShadow * 0.72)
+      ..lineTo(stileInnerL, h + _ShelfDims.crownCastShadow * 0.35)
+      ..close();
+    crownSideShadowRight = Path()
+      ..moveTo(stileInnerR - depth, h)
+      ..lineTo(stileInnerR, h)
+      ..lineTo(stileInnerR, h + _ShelfDims.crownCastShadow * 0.35)
+      ..lineTo(stileInnerR - depth, h + _ShelfDims.crownCastShadow * 0.72)
+      ..close();
+
+    crownCapPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          Color.lerp(palette.faceTop, palette.highlight, 0.25)!,
+          palette.faceTop,
+        ],
+      ).createShader(crownCapRect);
+    crownCapUnderShadowPaint = Paint()..color = Colors.black.withAlpha(185);
+
+    crownCovePaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          Color.lerp(palette.faceBottom, Colors.black, 0.38)!,
+          Color.lerp(palette.faceBottom, palette.faceTop, 0.35)!,
+        ],
+      ).createShader(crownCoveBounds);
+
+    crownFriezePaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [palette.faceTop, palette.faceBottom],
+      ).createShader(crownFriezeRect);
+    crownFriezeTopShadowPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [Colors.black.withAlpha(115), Colors.black.withAlpha(0)],
+      ).createShader(crownFriezeTopShadowRect);
+
+    crownEndsPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Colors.black.withAlpha(80),
+          Colors.black.withAlpha(0),
+          Colors.black.withAlpha(0),
+          Colors.black.withAlpha(80),
+        ],
+        stops: const [0.0, 0.03, 0.97, 1.0],
+      ).createShader(crownFriezeRect);
+
+    crownShadowPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          Colors.black.withAlpha(215),
+          Colors.black.withAlpha(105),
+          Colors.black.withAlpha(0),
+        ],
+        stops: const [0.0, 0.42, 1.0],
+      ).createShader(crownShadowRect);
+    crownSideShadowPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          Colors.black.withAlpha(185),
+          Colors.black.withAlpha(55),
+          Colors.black.withAlpha(0),
+        ],
+        stops: const [0.0, 0.5, 1.0],
+      ).createShader(
+        Rect.fromLTWH(0, h, w, _ShelfDims.crownCastShadow * 0.75),
+      );
+
+    // Subtle vertical cabinetry joinery seams where the stiles meet the header.
+    crownJointPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = Colors.black.withAlpha(110);
+    crownJointLightPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = Colors.white.withAlpha(26);
+    crownJoints = Path()
+      ..moveTo(stileInnerL, capH + coveH)
+      ..lineTo(stileInnerL, h)
+      ..moveTo(stileInnerR, capH + coveH)
+      ..lineTo(stileInnerR, h);
+    crownJointsLight = crownJoints.shift(const Offset(1.0, 0.0));
+
+    final math.Random rnd = math.Random(4242);
+    crownCapGrain = _buildGrain(
+      crownCapRect,
+      rnd,
+      math.max(6, (w / 44).round()),
+    );
+    crownFriezeGrain = _buildGrain(
+      crownFriezeRect,
+      rnd,
+      math.max(10, (w / 14).round()),
+    );
+  }
+
+  void _buildBase() {
+    const double plankH = _ShelfDims.plankHeight;
+    const double apronH = _ShelfDims.baseApron;
+    const double footH = _ShelfDims.baseFootHeight;
+    const double totalH = _ShelfDims.baseTotalHeight;
+    final double fw = frontWidth;
+
+    // Local coordinates where x = 0 is the inner edge of the left front stile
+    // and x = fw is the inner edge of the right front stile.
+    baseApronRect = Rect.fromLTWH(0, plankH, fw, apronH);
+    baseApronTopShadowRect = Rect.fromLTWH(0, plankH, fw, 6.0);
+    baseApronBottomEdgeRect = Rect.fromLTWH(0, plankH + apronH - 1.5, fw, 1.5);
+    baseKickVoidRect = Rect.fromLTWH(0, plankH + apronH, fw, footH);
+    baseFloorShadowRect = Rect.fromLTWH(
+      -_ShelfDims.sideFrontWidth,
+      totalH - 1.0,
+      fw + 2 * _ShelfDims.sideFrontWidth,
+      6.0,
+    );
+
+    baseApronPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [palette.faceTop, palette.faceBottom],
+      ).createShader(baseApronRect);
+    baseApronTopShadowPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [Colors.black.withAlpha(155), Colors.black.withAlpha(0)],
+      ).createShader(baseApronTopShadowRect);
+    baseApronEndsPaint = Paint()
+      ..shader = LinearGradient(
+        colors: [
+          Colors.black.withAlpha(90),
+          Colors.black.withAlpha(0),
+          Colors.black.withAlpha(0),
+          Colors.black.withAlpha(90),
+        ],
+        stops: const [0.0, 0.03, 0.97, 1.0],
+      ).createShader(baseApronRect);
+
+    baseKickVoidPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          Colors.black.withAlpha(210),
+          Colors.black.withAlpha(135),
+          Colors.black.withAlpha(70),
+        ],
+        stops: const [0.0, 0.55, 1.0],
+      ).createShader(baseKickVoidRect);
+    baseFloorShadowPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [Colors.black.withAlpha(150), Colors.black.withAlpha(0)],
+      ).createShader(baseFloorShadowRect);
+
+    final math.Random rnd = math.Random(9001);
+    baseApronGrain = _buildGrain(
+      baseApronRect,
+      rnd,
+      math.max(10, (fw / 15).round()),
+    );
+  }
+
+  void paintWallSideShadows(Canvas canvas, Size size) {
+    canvas.drawRect(
+      Rect.fromLTRB(
+        wallSideShadowRect.left,
+        0,
+        wallSideShadowRect.right,
+        size.height,
+      ),
+      wallSideShadowPaint,
+    );
+    canvas.save();
+    canvas.translate(size.width, 0.0);
+    canvas.scale(-1.0, 1.0);
+    canvas.drawRect(
+      Rect.fromLTRB(
+        wallSideShadowRect.left,
+        0,
+        wallSideShadowRect.right,
+        size.height,
+      ),
+      wallSideShadowPaint,
+    );
+    canvas.restore();
+  }
+
+  void paintSurroundBand(Canvas canvas, double top, double bottom) {
+    if (bottom <= top) return;
+    canvas.drawRect(Rect.fromLTRB(0, top, width, bottom), surroundPaint);
+  }
+
+  void paintFloorArea(Canvas canvas, double top, double bottom) {
+    if (bottom <= top) return;
+    canvas.drawRect(Rect.fromLTRB(0, top, width, bottom), floorPaint);
+  }
+
+  void paintUprights(
+      Canvas canvas,
+      double viewportWidth, {
+        required double top,
+        required double bottom,
+      }) {
+    if (bottom <= top) return;
+    _paintUprightSpan(canvas, top, bottom, 0.0);
+    canvas.save();
+    canvas.translate(viewportWidth, 0.0);
+    canvas.scale(-1.0, 1.0);
+    _paintUprightSpan(canvas, top, bottom, 0.43);
+    canvas.restore();
+  }
+
+  void _paintUprightSpan(
+      Canvas canvas,
+      double top,
+      double bottom,
+      double phase,
+      ) {
+    canvas.save();
+    canvas.clipRect(Rect.fromLTRB(0, top, _ShelfDims.sideTotalWidth, bottom));
+    canvas.drawRect(
+      Rect.fromLTRB(stripRect.left, top, stripRect.right, bottom),
+      stripPaint,
+    );
+    _paintGrainTiles(canvas, top, bottom, phase, stripGrain, withLight: false);
+    canvas.drawRect(
+      Rect.fromLTRB(stripSeamRect.left, top, stripSeamRect.right, bottom),
+      stripSeamPaint,
+    );
+    canvas.drawRect(
+      Rect.fromLTRB(stileShadowRect.left, top, stileShadowRect.right, bottom),
+      stileShadowPaint,
+    );
+    canvas.drawRect(
+      Rect.fromLTRB(stileRect.left, top, stileRect.right, bottom),
+      stilePaint,
+    );
+    _paintGrainTiles(canvas, top, bottom, phase, stileGrain, withLight: true);
+    canvas.drawRect(
+      Rect.fromLTRB(stileSheenRect.left, top, stileSheenRect.right, bottom),
+      stileSheenPaint,
+    );
+    canvas.drawRect(
+      Rect.fromLTRB(stileBevelRect.left, top, stileBevelRect.right, bottom),
+      highlightPaint,
+    );
+    canvas.drawRect(
+      Rect.fromLTRB(stileEdgeRect.left, top, stileEdgeRect.right, bottom),
+      edgePaint,
+    );
+    canvas.restore();
+  }
+
+  void _paintGrainTiles(
+      Canvas canvas,
+      double top,
+      double bottom,
+      double phase,
+      _GrainPaths grain, {
+        required bool withLight,
+      }) {
+    const double tile = _ShelfDims.uprightTile;
+    final double startY =
+        ((top + phase * tile) / tile).floor() * tile - phase * tile;
+    for (double y = startY; y < bottom; y += tile) {
+      canvas.save();
+      canvas.translate(0.0, y);
+      canvas.drawPath(grain.dark, grainDarkPaint);
+      if (withLight) canvas.drawPath(grain.light, grainLightPaint);
+      canvas.restore();
+    }
+  }
+
+  /// Paints the uppermost plank / stepped crown cornice at [top].
+  void paintCrown(Canvas canvas, double top) {
     canvas.save();
     canvas.translate(0.0, top);
-    canvas.drawRect(shadowRect, shadowPaint);
+
+    // 1. Cast shadows into the top compartment (back wall + recessed sides).
+    canvas.drawRect(crownShadowRect, crownShadowPaint);
+    canvas.drawPath(crownSideShadowLeft, crownSideShadowPaint);
+    canvas.drawPath(crownSideShadowRight, crownSideShadowPaint);
+
+    // 2. Main upper header board / frieze.
+    canvas.drawRect(crownFriezeRect, crownFriezePaint);
+    canvas.drawPath(crownFriezeGrain.dark, grainDarkPaint);
+    canvas.drawPath(crownFriezeGrain.light, grainLightPaint);
+    canvas.drawRect(crownFriezeTopShadowRect, crownFriezeTopShadowPaint);
+    canvas.drawPath(crownJoints, crownJointPaint);
+    canvas.drawPath(crownJointsLight, crownJointLightPaint);
+    canvas.drawRect(crownBeadRect, highlightPaint);
+    canvas.drawRect(crownEdgeRect, edgePaint);
+    canvas.drawRect(crownFriezeRect, crownEndsPaint);
+
+    // 3. Tapered cove molding tucked under the overhanging top cap.
+    canvas.drawPath(crownCovePath, crownCovePaint);
+
+    // 4. Full-width overhanging top cap lip.
+    canvas.drawRect(crownCapRect, crownCapPaint);
+    canvas.drawPath(crownCapGrain.dark, grainDarkPaint);
+    canvas.drawPath(crownCapGrain.light, grainLightPaint);
+    canvas.drawRect(crownCapHighlightRect, highlightPaint);
+    canvas.drawRect(crownCapUnderShadowRect, crownCapUnderShadowPaint);
+
+    canvas.restore();
+  }
+
+  /// Paints the lowermost plank, solid baseboard apron, and side bookcase feet
+  /// whose shelf top surface sits at [top].
+  void paintBase(Canvas canvas, double top, int index) {
+    if (!hasRoom) return;
+    final _PlankGrain grain = grains[(index * 5) % _variantCount];
+    canvas.save();
+    canvas.translate(frontLeft, top);
+
+    // 1. Recessed under-cabinet toe-kick void & floor shadow between the legs.
+    canvas.drawRect(baseKickVoidRect, floorPaint);
+    canvas.drawRect(baseKickVoidRect, baseKickVoidPaint);
+    canvas.drawRect(baseFloorShadowRect, baseFloorShadowPaint);
+
+    // 2. Solid horizontal baseboard / apron plinth between the front stiles.
+    canvas.drawRect(baseApronRect, baseApronPaint);
+    canvas.drawPath(baseApronGrain.dark, grainDarkPaint);
+    canvas.drawPath(baseApronGrain.light, grainLightPaint);
+    canvas.drawRect(baseApronTopShadowRect, baseApronTopShadowPaint);
+    canvas.drawRect(baseApronBottomEdgeRect, edgePaint);
+    canvas.drawRect(baseApronRect, baseApronEndsPaint);
+
+    // 3. Bottom shelf trapezoidal top surface (where the lowest comics sit).
+    canvas.save();
+    canvas.clipPath(surfacePath);
     canvas.drawRect(surfaceRect, surfacePaint);
     canvas.drawPath(grain.surface.dark, grainDarkPaint);
     canvas.drawPath(grain.surface.light, grainLightPaint);
     canvas.drawRect(occlusionRect, occlusionPaint);
+    canvas.drawRect(surfaceSideShadowRect, surfaceSideShadowPaint);
+    canvas.restore();
+
+    // 4. Bottom shelf front vertical face.
     canvas.drawRect(faceRect, facePaint);
     canvas.drawPath(grain.face.dark, grainDarkPaint);
     canvas.drawPath(grain.face.light, grainLightPaint);
     canvas.drawRect(highlightRect, highlightPaint);
     canvas.drawRect(edgeRect, edgePaint);
     canvas.drawRect(sheenRect, sheenPaint);
-    canvas.drawRect(wholeRect, endsPaint);
+    canvas.drawRect(faceRect, endsPaint);
+
+    canvas.restore();
+  }
+
+  /// Draws an intermediate plank whose top edge is at [top].
+  void paint(Canvas canvas, double top, int index) {
+    if (!hasRoom) return;
+    final _PlankGrain grain = grains[(index * 5) % _variantCount];
+    canvas.save();
+    canvas.translate(frontLeft, top);
+
+    // 1. Cast shadows onto the back panel and recessed side walls.
+    canvas.drawRect(shadowRect, shadowPaint);
+    canvas.drawPath(sideJointShadowLeft, sideJointShadowPaint);
+    canvas.drawPath(sideJointShadowRight, sideJointShadowPaint);
+
+    // 2. Trapezoidal flat top surface with full-depth ambient occlusion.
+    canvas.save();
+    canvas.clipPath(surfacePath);
+    canvas.drawRect(surfaceRect, surfacePaint);
+    canvas.drawPath(grain.surface.dark, grainDarkPaint);
+    canvas.drawPath(grain.surface.light, grainLightPaint);
+    canvas.drawRect(occlusionRect, occlusionPaint);
+    canvas.drawRect(surfaceSideShadowRect, surfaceSideShadowPaint);
+    canvas.restore();
+
+    // 3. Front vertical face spanning flush between the two front stiles.
+    canvas.drawRect(faceRect, facePaint);
+    canvas.drawPath(grain.face.dark, grainDarkPaint);
+    canvas.drawPath(grain.face.light, grainLightPaint);
+    canvas.drawRect(highlightRect, highlightPaint);
+    canvas.drawRect(edgeRect, edgePaint);
+    canvas.drawRect(sheenRect, sheenPaint);
+    canvas.drawRect(faceRect, endsPaint);
+
     canvas.restore();
   }
 }
@@ -3531,18 +5619,20 @@ class _ShelfBook extends StatelessWidget {
       decoration: const BoxDecoration(
         borderRadius: _radius,
         boxShadow: <BoxShadow>[
-          // Tight shadow cast onto the plank surface and the wall.
+          // Tight contact shadow where the book rests on the shelf surface
+          // (stays within the 5 dp front lip so the front plank face stays crisp).
           BoxShadow(
-            color: Color(0xA6000000),
-            blurRadius: 9,
-            offset: Offset(5, 3),
+            color: Color(0xCC000000),
+            blurRadius: 3.5,
+            spreadRadius: -0.5,
+            offset: Offset(0, 1.5),
           ),
-          // Wide, soft ambient shadow.
+          // Recessed depth shadow cast behind and slightly right onto the back wall.
           BoxShadow(
-            color: Color(0x59000000),
-            blurRadius: 22,
-            spreadRadius: 1,
-            offset: Offset(0, 8),
+            color: Color(0x66000000),
+            blurRadius: 9,
+            spreadRadius: -1.5,
+            offset: Offset(2.5, -3.5),
           ),
         ],
       ),
@@ -3567,54 +5657,4 @@ class _ShelfBook extends StatelessWidget {
   }
 }
 
-/// Two-line caption under a shelf. Clips instead of overflowing when the
-/// system font scale is large.
-class _ShelfCaption extends StatelessWidget {
-  const _ShelfCaption({
-    required this.title,
-    required this.subtitle,
-    required this.subtitleColor,
-  });
 
-  final String title;
-  final String subtitle;
-  final Color subtitleColor;
-
-  @override
-  Widget build(BuildContext context) {
-    final ThemeData theme = Theme.of(context);
-    return ClipRect(
-      child: OverflowBox(
-        alignment: Alignment.topLeft,
-        minHeight: 0,
-        maxHeight: double.infinity,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.titleSmall?.copyWith(
-                fontSize: 13,
-                height: 1.25,
-              ),
-            ),
-            const SizedBox(height: 2),
-            Text(
-              subtitle,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: theme.textTheme.bodySmall?.copyWith(
-                fontSize: 11.5,
-                height: 1.25,
-                color: subtitleColor,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
