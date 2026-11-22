@@ -8,6 +8,8 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/services.dart'
+    show BackgroundIsolateBinaryMessenger, MethodChannel, RootIsolateToken;
 import 'package:rar/rar.dart';
 
 import 'comic_cache_service.dart';
@@ -16,6 +18,178 @@ import 'comic_page_source.dart';
 import 'isolate_rpc.dart';
 
 enum ComicArchiveFormat { zip, rar, unknown }
+
+// =============================================================================
+// Random-access byte readers (filesystem path or Android SAF content:// URI)
+// =============================================================================
+
+const String _safChannelName = 'panelshift/saf_picker';
+
+/// Positional, read-only access to an archive's bytes, so the same parsing code
+/// can read a regular file or a `content://` document without copying it.
+abstract class RandomAccessByteReader {
+  /// Total size of the source in bytes.
+  Future<int> length();
+
+  /// Up to [length] bytes starting at [offset]; shorter only at end of source.
+  Future<Uint8List> readAt(int offset, int length);
+
+  Future<void> close();
+
+  /// [SafUriByteReader] for `content://` sources, [FileByteReader] otherwise.
+  static RandomAccessByteReader forPath(String sourcePath) =>
+      sourcePath.startsWith('content://')
+      ? SafUriByteReader(sourcePath)
+      : FileByteReader(sourcePath);
+}
+
+/// [RandomAccessByteReader] over a normal filesystem path.
+class FileByteReader implements RandomAccessByteReader {
+  FileByteReader(this.path);
+
+  final String path;
+
+  Future<RandomAccessFile>? _opening;
+  Future<void> _queue = Future<void>.value();
+
+  Future<RandomAccessFile> _file() => _opening ??= File(path).open();
+
+  // setPosition + read must not interleave between concurrent callers.
+  Future<T> _serial<T>(Future<T> Function() action) {
+    final Future<T> result = _queue.then<T>((_) => action());
+    _queue = result.then<void>((_) {}, onError: (Object _) {});
+    return result;
+  }
+
+  @override
+  Future<int> length() =>
+      _serial<int>(() async => (await _file()).length());
+
+  @override
+  Future<Uint8List> readAt(int offset, int length) =>
+      _serial<Uint8List>(() async {
+        final RandomAccessFile raf = await _file();
+        await raf.setPosition(offset);
+        return raf.read(length);
+      });
+
+  @override
+  Future<void> close() async {
+    final Future<RandomAccessFile>? opening = _opening;
+    _opening = null;
+    if (opening == null) return;
+    try {
+      await _queue;
+      await (await opening).close();
+    } catch (_) {
+      // Already closed or never opened.
+    }
+  }
+}
+
+/// Name, size and fingerprint of a SAF document, from `statAndHashUri`.
+class SafUriStat {
+  const SafUriStat({
+    required this.fileName,
+    required this.size,
+    required this.md5Prefix,
+  });
+
+  final String fileName;
+  final int size;
+
+  /// Lowercase hex MD5 of the first 64 KB (same bytes `ComicIdentity.fromFile`
+  /// hashes).
+  final String md5Prefix;
+}
+
+/// [RandomAccessByteReader] over an Android `content://` URI, through the
+/// `readUriRange` / `statAndHashUri` calls of `panelshift/saf_picker`. Safe to
+/// use from a background isolate once
+/// `BackgroundIsolateBinaryMessenger.ensureInitialized` has run there.
+class SafUriByteReader implements RandomAccessByteReader {
+  SafUriByteReader(this.uri);
+
+  static const MethodChannel _channel = MethodChannel(_safChannelName);
+
+  final String uri;
+  int? _length;
+
+  /// Null when the document is missing or no longer readable.
+  static Future<SafUriStat?> stat(String uri) async {
+    final Map<String, dynamic>? reply = await _channel
+        .invokeMapMethod<String, dynamic>(
+          'statAndHashUri',
+          <String, Object?>{'uri': uri},
+        );
+    if (reply == null || reply['exists'] != true) return null;
+    final Object? size = reply['size'];
+    final Object? md5 = reply['md5Prefix'];
+    if (size is! num || md5 is! String) return null;
+    return SafUriStat(
+      fileName: (reply['fileName'] as String?) ?? '',
+      size: size.toInt(),
+      md5Prefix: md5,
+    );
+  }
+
+  /// Stages the document as a real file in the app cache (`copyDocumentToCache`)
+  /// and returns its path. Only for archives that need a POSIX path (.cbr/.rar);
+  /// the caller must delete the file when done.
+  static Future<String> copyToCache(String uri, String name) async {
+    final String? path = await _channel.invokeMethod<String>(
+      'copyDocumentToCache',
+      <String, Object?>{'uri': uri, 'name': name},
+    );
+    if (path == null || path.isEmpty) {
+      throw FileSystemException('Could not stage the archive for extraction', uri);
+    }
+    return path;
+  }
+
+  @override
+  Future<int> length() async {
+    final int? cached = _length;
+    if (cached != null) return cached;
+    final SafUriStat? info = await stat(uri);
+    if (info == null) {
+      throw FileSystemException('Document is missing or unreadable', uri);
+    }
+    return _length = info.size;
+  }
+
+  @override
+  Future<Uint8List> readAt(int offset, int length) async {
+    if (length <= 0) return Uint8List(0);
+    final Uint8List? data = await _channel.invokeMethod<Uint8List>(
+      'readUriRange',
+      <String, Object?>{'uri': uri, 'offset': offset, 'length': length},
+    );
+    if (data == null) {
+      throw FileSystemException('Could not read from document', uri);
+    }
+    return data;
+  }
+
+  @override
+  Future<void> close() async {}
+}
+
+/// Boot argument for the CBZ worker: the root isolate token it needs to use
+/// platform channels, only when the archive is a `content://` document.
+Object? _workerBootArg(String sourcePath) =>
+    sourcePath.startsWith('content://') ? RootIsolateToken.instance : null;
+
+/// Byte length of a path or `content://` source; throws [FileSystemException]
+/// when it is missing.
+Future<int> _sourceLength(String sourcePath) async {
+  if (!sourcePath.startsWith('content://')) return File(sourcePath).length();
+  final SafUriStat? info = await SafUriByteReader.stat(sourcePath);
+  if (info == null) {
+    throw FileSystemException('Document is missing or unreadable', sourcePath);
+  }
+  return info.size;
+}
 
 /// Optional capability of a [ComicPageSource]: measure a contiguous range of
 /// pages from their image headers only, without decoding or fully reading them.
@@ -86,7 +260,9 @@ class ComicParserService {
   static List<T> sortNaturally<T>(List<T> items, String Function(T item) nameOf) =>
       _sortNaturally<T>(items, nameOf);
 
-  /// Opens a .cbz/.zip/.cbr/.rar file. The format is detected from its magic
+  /// Opens a .cbz/.zip/.cbr/.rar file or `content://` document (read in place,
+  /// never copied; only .cbr/.rar is staged briefly for extraction). The format
+  /// is detected from its magic
   /// bytes, with the extension used only when the header is unrecognised.
   ///
   /// The page index is cached by comic id ([ComicCacheService.readIndexCache]),
@@ -121,9 +297,7 @@ class ComicParserService {
     required bool retainCbrCache,
     required bool waitForIndexJob,
   }) async {
-    final Future<ComicIdentity> identityFuture = ComicIdentity.fromFile(
-      filePath,
-    );
+    final Future<ComicIdentity> identityFuture = identityFor(filePath);
     final Future<ComicArchiveFormat> formatFuture = detectFormat(filePath);
 
     final List<Object> both = await Future.wait<Object>(<Future<Object>>[
@@ -132,6 +306,9 @@ class ComicParserService {
     ]);
     final ComicIdentity identity = both[0] as ComicIdentity;
     final ComicArchiveFormat format = both[1] as ComicArchiveFormat;
+    // For a content:// source the size is already known from the identity stat
+    // (it is part of the id), so later steps need no second platform call.
+    final int? knownLength = _knownLengthOf(filePath, identity);
 
     // A background pre-index of this very comic is already doing the work the
     // open would do. Wait for it instead of duplicating it (never fails the open).
@@ -177,12 +354,16 @@ class ComicParserService {
       filePath,
       identity,
       index,
+      knownLength: knownLength,
     );
     if (cachedZip != null) {
       return LoadedComic(source: cachedZip, identity: identity);
     }
 
-    final ZipPageSource source = await ZipPageSource.open(filePath);
+    final ZipPageSource source = await ZipPageSource.open(
+      filePath,
+      knownLength: knownLength,
+    );
     unawaited(_persistZipIndex(cache, identity.id, source));
     return LoadedComic(source: source, identity: identity);
   }
@@ -198,8 +379,9 @@ class ComicParserService {
     ComicCacheService cache,
     String filePath,
     ComicIdentity identity,
-    Map<String, dynamic>? index,
-  ) async {
+    Map<String, dynamic>? index, {
+    int? knownLength,
+  }) async {
     final Object? raw = index?['source'];
     if (raw is! Map<String, dynamic> || raw['type'] != 'zip') return null;
 
@@ -208,7 +390,7 @@ class ComicParserService {
 
     final int actualLength;
     try {
-      actualLength = await File(filePath).length();
+      actualLength = knownLength ?? await _sourceLength(filePath);
     } on FileSystemException {
       return null;
     }
@@ -312,13 +494,18 @@ class ComicParserService {
   /// between batches, and [gate] is awaited before each batch (the caller can
   /// hold work back while a reader is on screen). Concurrent [loadComic] calls
   /// for the same comic wait for this job instead of repeating it. Never throws.
+  ///
+  /// [extractCbr] is off by default: indexing a .cbr/.rar means unpacking the
+  /// whole archive into the CBR cache, so it is skipped here and happens on
+  /// first open instead. .cbz/.zip archives are indexed from their headers
+  /// only, which costs a tiny JSON file.
   static Future<void> preIndex(
     String filePath, {
-    bool extractCbr = true,
+    bool extractCbr = false,
     Future<void> Function()? gate,
   }) async {
     try {
-      final ComicIdentity identity = await ComicIdentity.fromFile(filePath);
+      final ComicIdentity identity = await identityFor(filePath);
       final Future<void>? running = _indexJobs[identity.id];
       if (running != null) {
         await running;
@@ -353,7 +540,7 @@ class ComicParserService {
 
     if (await detectFormat(filePath) == ComicArchiveFormat.rar) {
       if (!extractCbr) return;
-      if (await File(filePath).length() > preIndexMaxCbrBytes) return;
+      if (await _sourceLength(filePath) > preIndexMaxCbrBytes) return;
     }
 
     final LoadedComic loaded = await _loadComic(
@@ -405,15 +592,44 @@ class ComicParserService {
     return true;
   }
 
+  /// Identity of the comic at [sourcePath], a filesystem path or a `content://`
+  /// URI. Both give the same id format, so progress and caches are shared.
+  static Future<ComicIdentity> identityFor(String sourcePath) async {
+    if (!sourcePath.startsWith('content://')) {
+      return ComicIdentity.fromFile(sourcePath);
+    }
+    final SafUriStat? info = await SafUriByteReader.stat(sourcePath);
+    if (info == null) {
+      throw FileSystemException('Document is missing or unreadable', sourcePath);
+    }
+    return ComicIdentity.fromUri(
+      uri: sourcePath,
+      fileName: info.fileName.isEmpty ? 'Untitled comic' : info.fileName,
+      fileSize: info.size,
+      md5Prefix: info.md5Prefix,
+    );
+  }
+
+  /// File size of a content:// source, read back from the identity id
+  /// (`<md5>_<size>`); null for filesystem paths (they are cheap to stat).
+  static int? _knownLengthOf(String sourcePath, ComicIdentity identity) {
+    if (!sourcePath.startsWith('content://')) return null;
+    final String id = identity.id;
+    return int.tryParse(id.substring(id.lastIndexOf('_') + 1));
+  }
+
   static String _newExtractionKey(String identity) {
     _cacheAttemptSequence++;
     return '${identity}_${DateTime.now().microsecondsSinceEpoch}_$_cacheAttemptSequence';
   }
 
-  static Future<ComicArchiveFormat> detectFormat(String filePath) async {
-    final RandomAccessFile raf = await File(filePath).open();
+  static Future<ComicArchiveFormat> detectFormat(String sourcePath) async {
+    // First 8 bytes only: from the file, or from the SAF URI via readUriRange.
+    final RandomAccessByteReader reader = RandomAccessByteReader.forPath(
+      sourcePath,
+    );
     try {
-      final Uint8List head = await raf.read(8);
+      final Uint8List head = await reader.readAt(0, 8);
 
       // ZIP: "PK\x03\x04" (also "PK\x05\x06" empty / "PK\x07\x08" spanned).
       if (head.length >= 4 &&
@@ -434,10 +650,10 @@ class ComicParserService {
         return ComicArchiveFormat.rar;
       }
     } finally {
-      await raf.close();
+      await reader.close();
     }
 
-    final String lower = filePath.toLowerCase();
+    final String lower = sourcePath.toLowerCase();
     if (lower.endsWith('.cbr') || lower.endsWith('.rar')) {
       return ComicArchiveFormat.rar;
     }
@@ -448,7 +664,9 @@ class ComicParserService {
   // CBR (RAR)
   // ---------------------------------------------------------------------------
 
-  /// Extracts [filePath] into the cache and returns a lazy disk-backed source.
+  /// Extracts [filePath] (a path or a `content://` URI, which is staged to a
+  /// temporary file that is always deleted afterwards) into the cache and
+  /// returns a lazy disk-backed source.
   ///
   /// When the plugin or page-index isolate exceeds its timeout, this method
   /// returns an error to the caller immediately. Because neither operation
@@ -466,10 +684,23 @@ class ComicParserService {
     final ComicCacheService cache = ComicCacheService.instance;
     final Directory workDir = await cache.acquire(cacheKey);
     bool cleanupDeferred = false;
+    String? stagedPath;
 
     try {
+      // The RAR plugin needs a real file. A content:// archive is staged into
+      // the app cache just for the extraction and removed again in `finally`,
+      // so no duplicate .cbr stays on disk.
+      String archivePath = filePath;
+      if (filePath.startsWith('content://')) {
+        stagedPath = await SafUriByteReader.copyToCache(
+          filePath,
+          '$cacheKey.rar',
+        );
+        archivePath = stagedPath;
+      }
+
       final Future<dynamic> extraction = Rar.extractRarFile(
-        rarFilePath: filePath,
+        rarFilePath: archivePath,
         destinationPath: workDir.path,
       );
 
@@ -510,6 +741,14 @@ class ComicParserService {
         await cache.release(cacheKey);
       }
       Error.throwWithStackTrace(error, stackTrace);
+    } finally {
+      if (stagedPath != null) {
+        try {
+          await File(stagedPath).delete();
+        } catch (_) {
+          // Best effort; the picker cache is also swept by the OS.
+        }
+      }
     }
   }
 
@@ -759,11 +998,11 @@ class ZipPageSource implements ComicPageSource, PageDimensionProbe {
   /// Length of the archive when this index was built (cache validation).
   int get indexedFileLength => _fileLength;
 
-  static Future<ZipPageSource> open(String filePath) async {
-    final int length = await File(filePath).length();
+  static Future<ZipPageSource> open(String filePath, {int? knownLength}) async {
+    final int length = knownLength ?? await _sourceLength(filePath);
     final IsolateRpc rpc = await IsolateRpc.spawn(
       _zipWorkerMain,
-      null,
+      _workerBootArg(filePath),
       debugName: 'cbz-reader',
     );
 
@@ -867,7 +1106,7 @@ class ZipPageSource implements ComicPageSource, PageDimensionProbe {
     final _ZipIndex index = _index!;
     final IsolateRpc rpc = await IsolateRpc.spawn(
       _zipWorkerMain,
-      null,
+      _workerBootArg(_filePath),
       debugName: 'cbz-reader',
     );
 
@@ -1004,11 +1243,22 @@ class _ZipEntry {
 }
 
 void _zipWorkerMain(List<Object?> boot) {
+  // A content:// archive is read through the platform channel, which a
+  // background isolate may only use after this call.
+  final Object? init = boot.length > 1 ? boot[1] : null;
+  if (init is RootIsolateToken) {
+    BackgroundIsolateBinaryMessenger.ensureInitialized(init);
+  }
   final _ZipWorker worker = _ZipWorker();
   serveRpc(boot[0] as SendPort, worker.handle);
 }
 
 class _ZipWorker {
+  // content:// mode: the archive is read through [_reader] (async). File mode
+  // keeps the original synchronous RandomAccessFile code path untouched.
+  bool _asyncMode = false;
+  RandomAccessByteReader? _reader;
+
   RandomAccessFile? _raf;
   List<_ZipEntry> _entries = const <_ZipEntry>[];
   bool _useFallback = false;
@@ -1017,18 +1267,26 @@ class _ZipWorker {
   Object? handle(String op, Object? args) {
     switch (op) {
       case 'open':
-        return _open(args as String);
+        final String openPath = args as String;
+        return openPath.startsWith('content://')
+            ? _openSaf(openPath)
+            : _open(openPath);
       case 'attach':
         final List<dynamic> wire = args as List<dynamic>;
-        return _attach(wire[0] as String, wire.sublist(1));
+        final String attachPath = wire[0] as String;
+        return attachPath.startsWith('content://')
+            ? _attachSaf(attachPath, wire.sublist(1))
+            : _attach(attachPath, wire.sublist(1));
       case 'read':
-        return _read(args as int);
+        return _asyncMode ? _readAsync(args as int) : _read(args as int);
       case 'dims':
         final List<dynamic> range = args as List<dynamic>;
         if (range.length != 2) {
           throw const FormatException('Invalid dimensions request');
         }
-        return _dims(range[0] as int, range[1] as int);
+        return _asyncMode
+            ? _dimsAsync(range[0] as int, range[1] as int)
+            : _dims(range[0] as int, range[1] as int);
       case 'close':
         _close();
         return null;
@@ -1043,6 +1301,10 @@ class _ZipWorker {
     _entries = const <_ZipEntry>[];
     _fallback = const <ArchiveFile>[];
     _useFallback = false;
+    _asyncMode = false;
+    final RandomAccessByteReader? reader = _reader;
+    _reader = null;
+    if (reader != null) unawaited(reader.close());
     if (raf != null) {
       try {
         raf.closeSync();
@@ -1129,9 +1391,11 @@ class _ZipWorker {
     // nested names such as "Chapter 01/page_2.webp" are therefore included.
     // Apply the same path-aware filter used by the central-directory reader so
     // both parsing paths discover exactly the same kinds of page images.
-    final Archive archive = ZipDecoder().decodeBytes(
-      File(path).readAsBytesSync(),
-    );
+    return _openFallback(File(path).readAsBytesSync());
+  }
+
+  Object _openFallback(Uint8List bytes) {
+    final Archive archive = ZipDecoder().decodeBytes(bytes);
     final List<ArchiveFile> files = <ArchiveFile>[];
     for (final ArchiveFile file in archive.files) {
       if (!file.isFile) continue; // Skip explicit directory entries.
@@ -1186,6 +1450,110 @@ class _ZipWorker {
     }
     return out;
   }
+
+  // --- content:// (SAF) variants: same logic, async reads -------------------
+
+  Future<Object> _openSaf(String path) async {
+    _close();
+    final RandomAccessByteReader reader = SafUriByteReader(path);
+    List<_ZipEntry>? entries;
+    try {
+      entries = await _readCentralDirectoryAsync(reader);
+      if (entries != null) {
+        _reader = reader;
+        _asyncMode = true;
+        _entries = _sortNaturally<_ZipEntry>(
+          entries,
+          (_ZipEntry entry) => _normalizeArchiveEntryPath(entry.name),
+        );
+        return _openReply();
+      }
+
+      // ZIP64 / encrypted / unusual layouts: full decoder, in this isolate.
+      final Uint8List bytes = await _readWholeAsync(reader);
+      final Object reply = _openFallback(bytes);
+      _asyncMode = true;
+      return reply;
+    } finally {
+      if (!identical(_reader, reader)) await reader.close();
+    }
+  }
+
+  Future<int> _attachSaf(String path, List<dynamic> wire) async {
+    _close();
+    if (wire.length < 5) throw const FormatException('Invalid ZIP index');
+    final _ZipIndex? index = _ZipIndex.tryParse(
+      wire[0],
+      wire[1],
+      wire[2],
+      wire[3],
+      wire[4],
+    );
+    if (index == null) throw const FormatException('Invalid ZIP index');
+
+    final List<_ZipEntry> entries = index.toEntries();
+    final RandomAccessByteReader reader = SafUriByteReader(path);
+    try {
+      await _checkLocalHeaderAsync(reader, entries.first);
+      await _checkLocalHeaderAsync(reader, entries.last);
+    } catch (_) {
+      await reader.close();
+      rethrow;
+    }
+    _reader = reader;
+    _asyncMode = true;
+    _entries = entries;
+    return entries.length;
+  }
+
+  Future<TransferableTypedData> _readAsync(int index) async {
+    final int count = _useFallback ? _fallback.length : _entries.length;
+    if (index < 0 || index >= count) {
+      throw RangeError.range(index, 0, count - 1, 'index');
+    }
+
+    final Uint8List bytes;
+    if (_useFallback) {
+      bytes = Uint8List.fromList(_fallback[index].content as List<int>);
+    } else {
+      final RandomAccessByteReader? reader = _reader;
+      if (reader == null) throw StateError('ZIP reader is closed');
+      bytes = await _readEntryAsync(reader, _entries[index]);
+    }
+    return TransferableTypedData.fromList(<TypedData>[bytes]);
+  }
+
+  Future<Int32List> _dimsAsync(int start, int count) async {
+    final int total = _useFallback ? _fallback.length : _entries.length;
+    if (start < 0 || count < 0 || start + count > total) {
+      throw RangeError(
+        'Invalid dimensions range: start=$start count=$count total=$total',
+      );
+    }
+
+    final RandomAccessByteReader? reader = _reader;
+    final Int32List out = Int32List(count * 2);
+    for (int k = 0; k < count; k++) {
+      PageDimensions? dimensions;
+      try {
+        if (_useFallback) {
+          dimensions = ImageHeaderSniffer.sniff(
+            Uint8List.fromList(_fallback[start + k].content as List<int>),
+          );
+        } else if (reader != null) {
+          dimensions = await _sniffEntryAsync(reader, _entries[start + k]);
+        }
+      } catch (_) {
+        dimensions = null;
+      }
+
+      if (dimensions != null) {
+        out[k * 2] = dimensions.width;
+        out[k * 2 + 1] = dimensions.height;
+      }
+    }
+    return out;
+  }
 }
 
 // --- ZIP structure parsing --------------------------------------------------
@@ -1199,15 +1567,19 @@ int _u32(Uint8List bytes, int offset) =>
     (bytes[offset + 2] << 16) |
     (bytes[offset + 3] << 24);
 
-/// Parses the central directory. Returns null when the full decoder is needed.
-List<_ZipEntry>? _readCentralDirectory(RandomAccessFile raf) {
-  final int length = raf.lengthSync();
-  if (length < 22) return null;
+/// Location of the central directory, from the end-of-central-directory record.
+class _Eocd {
+  const _Eocd(this.totalEntries, this.cdSize, this.cdOffset);
 
-  final int tailLength = math.min(length, 22 + 0xFFFF);
-  raf.setPositionSync(length - tailLength);
-  final Uint8List tail = raf.readSync(tailLength);
+  final int totalEntries;
+  final int cdSize;
+  final int cdOffset;
+}
 
+/// Finds the EOCD record in [tail] (the last bytes of an archive of [length]
+/// bytes). Returns null when the full decoder is needed (multi-disk, ZIP64,
+/// inconsistent offsets) or no record exists.
+_Eocd? _parseEocd(Uint8List tail, int length) {
   int eocd = -1;
   for (int i = tail.length - 22; i >= 0; i--) {
     if (tail[i] != 0x50 ||
@@ -1239,11 +1611,57 @@ List<_ZipEntry>? _readCentralDirectory(RandomAccessFile raf) {
       cdOffset + cdSize > length) {
     return null;
   }
+  return _Eocd(totalEntries, cdSize, cdOffset);
+}
 
-  raf.setPositionSync(cdOffset);
-  final Uint8List centralDirectory = raf.readSync(cdSize);
-  if (centralDirectory.length != cdSize) return null;
+/// Parses the central directory. Returns null when the full decoder is needed.
+List<_ZipEntry>? _readCentralDirectory(RandomAccessFile raf) {
+  final int length = raf.lengthSync();
+  if (length < 22) return null;
 
+  final int tailLength = math.min(length, 22 + 0xFFFF);
+  raf.setPositionSync(length - tailLength);
+  final Uint8List tail = raf.readSync(tailLength);
+
+  final _Eocd? eocd = _parseEocd(tail, length);
+  if (eocd == null) return null;
+
+  raf.setPositionSync(eocd.cdOffset);
+  final Uint8List centralDirectory = raf.readSync(eocd.cdSize);
+  if (centralDirectory.length != eocd.cdSize) return null;
+
+  return _parseCentralDirectory(centralDirectory, eocd.totalEntries, length);
+}
+
+/// Same as [_readCentralDirectory], for any [RandomAccessByteReader] (used for
+/// `content://` archives).
+Future<List<_ZipEntry>?> _readCentralDirectoryAsync(
+  RandomAccessByteReader reader,
+) async {
+  final int length = await reader.length();
+  if (length < 22) return null;
+
+  final int tailLength = math.min(length, 22 + 0xFFFF);
+  final Uint8List tail = await reader.readAt(length - tailLength, tailLength);
+
+  final _Eocd? eocd = _parseEocd(tail, length);
+  if (eocd == null) return null;
+
+  final Uint8List centralDirectory = await reader.readAt(
+    eocd.cdOffset,
+    eocd.cdSize,
+  );
+  if (centralDirectory.length != eocd.cdSize) return null;
+
+  return _parseCentralDirectory(centralDirectory, eocd.totalEntries, length);
+}
+
+/// Walks the central-directory records and returns the page-image entries.
+List<_ZipEntry>? _parseCentralDirectory(
+  Uint8List centralDirectory,
+  int totalEntries,
+  int length,
+) {
   final List<_ZipEntry> pages = <_ZipEntry>[];
   int offset = 0;
   int entriesRead = 0;
@@ -1349,6 +1767,110 @@ PageDimensions? _sniffEntry(RandomAccessFile raf, _ZipEntry entry) {
     }
   }
   return ImageHeaderSniffer.sniff(_readEntry(raf, entry));
+}
+
+/// Local-header sanity check used when re-attaching a cached index.
+Future<void> _checkLocalHeaderAsync(
+  RandomAccessByteReader reader,
+  _ZipEntry entry,
+) async {
+  final Uint8List header = await reader.readAt(entry.localHeaderOffset, 30);
+  if (header.length < 30 || _u32(header, 0) != 0x04034B50) {
+    throw const FormatException('Corrupt ZIP local header');
+  }
+}
+
+/// Up to [maxData] bytes of an entry's compressed data. Header and data come
+/// from ONE read (header + [slack] + data), so a page costs a single platform
+/// call; a local header longer than the slack costs one more.
+Future<Uint8List> _readEntryDataAsync(
+  RandomAccessByteReader reader,
+  _ZipEntry entry,
+  int maxData,
+) async {
+  const int slack = 1024;
+  final int want = math.min(entry.compressedSize, maxData);
+  final Uint8List block = await reader.readAt(
+    entry.localHeaderOffset,
+    30 + slack + want,
+  );
+  if (block.length < 30 || _u32(block, 0) != 0x04034B50) {
+    throw const FormatException('Corrupt ZIP local header');
+  }
+  final int start = 30 + _u16(block, 26) + _u16(block, 28);
+  if (start + want <= block.length) {
+    return Uint8List.sublistView(block, start, start + want);
+  }
+  final Uint8List data = await reader.readAt(
+    entry.localHeaderOffset + start,
+    want,
+  );
+  if (data.length != want) throw const FormatException('Truncated ZIP entry');
+  return data;
+}
+
+Future<Uint8List> _readEntryAsync(
+  RandomAccessByteReader reader,
+  _ZipEntry entry,
+) async {
+  final Uint8List raw = await _readEntryDataAsync(
+    reader,
+    entry,
+    entry.compressedSize,
+  );
+  if (raw.length != entry.compressedSize) {
+    throw const FormatException('Truncated ZIP entry');
+  }
+  if (entry.method == 0) return raw;
+
+  final List<int> output = ZLibDecoder().decodeBytes(raw, raw: true);
+  return output is Uint8List ? output : Uint8List.fromList(output);
+}
+
+Future<PageDimensions?> _sniffEntryAsync(
+  RandomAccessByteReader reader,
+  _ZipEntry entry,
+) async {
+  if (entry.method == 0) {
+    final Uint8List head = await _readEntryDataAsync(reader, entry, _sniffBytes);
+    final PageDimensions? quick = ImageHeaderSniffer.sniff(head);
+    if (quick != null || entry.compressedSize <= head.length) return quick;
+  } else if (entry.method == 8) {
+    // Same shortcut as _sniffEntry: inflate only the first 64 KB.
+    try {
+      final Uint8List head = await _readEntryDataAsync(
+        reader,
+        entry,
+        _sniffBytes,
+      );
+      final Uint8List? prefix = _inflatePrefix(head);
+      if (prefix != null && prefix.isNotEmpty) {
+        final PageDimensions? quick = ImageHeaderSniffer.sniff(prefix);
+        if (quick != null) return quick;
+      }
+    } catch (_) {
+      // Fall through to the exact (full) path below.
+    }
+  }
+  return ImageHeaderSniffer.sniff(await _readEntryAsync(reader, entry));
+}
+
+/// Whole source as one buffer, in 4 MB reads (full-decoder fallback only).
+Future<Uint8List> _readWholeAsync(RandomAccessByteReader reader) async {
+  const int chunk = 4 * 1024 * 1024;
+  final int length = await reader.length();
+  final BytesBuilder builder = BytesBuilder(copy: false);
+  int offset = 0;
+  while (offset < length) {
+    final Uint8List part = await reader.readAt(
+      offset,
+      math.min(chunk, length - offset),
+    );
+    if (part.isEmpty) break;
+    builder.add(part);
+    offset += part.length;
+  }
+  return builder.takeBytes();
 }
 
 /// Collects the output of a chunked zlib conversion.

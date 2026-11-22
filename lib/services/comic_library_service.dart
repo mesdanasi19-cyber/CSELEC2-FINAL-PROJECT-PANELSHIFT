@@ -11,7 +11,8 @@ import 'comic_identity.dart';
 /// [ReadingProgressService] only remembers the single most recent comic; this
 /// service keeps the full list (newest import first) so the home screen can
 /// render a library. Reading positions stay in [ReadingProgressService]; this
-/// only stores identity (`id`, `title`, `sourcePath`).
+/// only stores identity (`id`, `title`, `sourcePath`) plus, for comics that came
+/// from a folder import, the optional shelf group (`groupId`, `groupName`).
 class ComicLibraryService {
   ComicLibraryService._();
 
@@ -70,12 +71,31 @@ class ComicLibraryService {
         );
         if (index >= 0) {
           final ComicIdentity existing = library[index];
+
+          // A comic that carries a group (folder import) moves into that
+          // group. One without a group (a single-file import, or simply
+          // re-opening a comic from the library) never takes it out of the
+          // folder shelf it already lives on.
+          final String? nextGroupId = comic.isGrouped
+              ? comic.groupId
+              : existing.groupId;
+          final String? nextGroupName = comic.isGrouped
+              ? comic.groupName
+              : existing.groupName;
+
           if (existing.sourcePath == comic.sourcePath &&
-              existing.title == comic.title) {
+              existing.title == comic.title &&
+              existing.groupId == nextGroupId &&
+              existing.groupName == nextGroupName) {
             return;
           }
-          library[index] = comic;
+          library[index] = comic.copyWith(
+            groupId: nextGroupId,
+            groupName: nextGroupName,
+          );
         } else {
+          // New entries keep exactly the grouping they arrive with: a
+          // single-file import (groupId == null) stays ungrouped.
           library.insert(0, comic);
         }
 
@@ -120,7 +140,16 @@ class ComicLibraryService {
   static String _encode(List<ComicIdentity> library) => jsonEncode(
     <Map<String, String>>[
       for (final ComicIdentity c in library)
-        <String, String>{'id': c.id, 'title': c.title, 'path': c.sourcePath},
+        <String, String>{
+          'id': c.id,
+          'title': c.title,
+          'path': c.sourcePath,
+          // Only written for folder imports, so ungrouped entries keep the
+          // exact shape older versions of the app wrote and read.
+          if (c.isGrouped) 'groupId': c.groupId!,
+          if (c.isGrouped && (c.groupName?.isNotEmpty ?? false))
+            'groupName': c.groupName!,
+        },
     ],
   );
 
@@ -141,7 +170,28 @@ class ComicLibraryService {
         final Object? path = item['path'];
         if (id is! String || title is! String || path is! String) continue;
         if (!seen.add(id)) continue;
-        result.add(ComicIdentity(id: id, title: title, sourcePath: path));
+
+        // Entries written before folder shelves existed have no group keys:
+        // they load as ungrouped (null / null), no migration needed.
+        final Object? rawGroupId = item['groupId'];
+        final Object? rawGroupName = item['groupName'];
+        final String? groupId = rawGroupId is String && rawGroupId.isNotEmpty
+            ? rawGroupId
+            : null;
+        final String? groupName =
+            groupId != null && rawGroupName is String && rawGroupName.isNotEmpty
+            ? rawGroupName
+            : null;
+
+        result.add(
+          ComicIdentity(
+            id: id,
+            title: title,
+            sourcePath: path,
+            groupId: groupId,
+            groupName: groupName,
+          ),
+        );
       }
     } catch (e) {
       debugPrint('ComicLibraryService: corrupt library record ignored: $e');

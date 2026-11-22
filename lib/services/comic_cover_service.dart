@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'comic_identity.dart';
@@ -23,9 +24,11 @@ class ComicCover {
 /// Produces and caches small cover thumbnails (page 0) for the library.
 ///
 /// Design:
-///  * Covers are downscaled PNGs stored on disk (application *support* dir, not
-///    the temp dir, so the OS cache cleaner and [ComicCacheService] never wipe
-///    them). Opening a .cbr just to show a cover would mean extracting the whole
+///  * Covers are downscaled thumbnails stored on disk (application *support*
+///    dir, not the temp dir, so the OS cache cleaner and [ComicCacheService]
+///    never wipe them). On Android they are compact JPEGs (~15-25 KB, encoded
+///    natively); elsewhere, or if the native encoder is unavailable, PNG.
+///    Covers cached as PNG by older versions keep loading unchanged. Opening a .cbr just to show a cover would mean extracting the whole
 ///    archive, so each cover is generated once and reused forever.
 ///  * At import time the archive is already open, so [adopt] builds the cover
 ///    from the live page source at almost no extra cost.
@@ -34,7 +37,7 @@ class ComicCover {
 ///    skips queued work that no visible card is waiting for any more.
 ///  * Memory is bounded by WIDTH *and* AREA (see [_coverWidth] and
 ///    [_coverMaxPixels]): whatever the page's aspect ratio, a stored cover
-///    decodes to at most ~1.5 MB of RGBA.
+///    decodes to at most ~0.7 MB of RGBA.
 ///  * Generation is scroll-aware: while the library is being scrolled the queue
 ///    parks ([setScrolling]), so archive extraction never competes with the
 ///    UI/raster threads for CPU during a fling on a low-end phone.
@@ -44,16 +47,20 @@ class ComicCoverService {
 
   static const String _folderName = 'panelshift_covers';
 
-  /// Hard ceiling for a stored cover's width. The library tile decodes with
-  /// `cacheWidth <= 480` as well (main.dart), so the file on disk and the
-  /// bitmap in the ImageCache obey the same bound.
-  static const int _coverWidth = 480;
+  /// Same channel as the SAF picker (see MainActivity.kt); used for the native
+  /// JPEG encoder.
+  static const MethodChannel _safChannel = MethodChannel('panelshift/saf_picker');
 
-  /// Second bound, on AREA: 480 x 800 px = 1.5 MB of decoded RGBA. A width-only
+  /// Hard ceiling for a stored cover's width. 320 px stays crisp on 2-6 column
+  /// grids; the library tile decodes with a `cacheWidth` no larger than this,
+  /// so the file on disk and the bitmap in the ImageCache obey the same bound.
+  static const int _coverWidth = 400;
+
+  /// Second bound, on AREA: 320 x 540 px = ~0.7 MB of decoded RGBA. A width-only
   /// limit does not bound memory for tall pages: an 800 x 20000 strip scaled to
-  /// 480 wide is still 480 x 12000 = 23 MB once the grid decodes it. With both
-  /// limits every cover decodes to <= ~1.5 MB regardless of aspect ratio.
-  static const int _coverMaxPixels = _coverWidth * 800;
+  /// 320 wide is still 320 x 8000 = 10 MB once the grid decodes it. With both
+  /// limits every cover decodes to <= ~0.7 MB regardless of aspect ratio.
+  static const int _coverMaxPixels = _coverWidth * 660;
 
   /// Minimum gap between two archive generations, so a burst of covers cannot
   /// hold the CPU for several consecutive frames.
@@ -124,7 +131,7 @@ class ComicCoverService {
 
   /// Tells the service whether the library list/grid is currently scrolling.
   ///
-  /// Queued generations (archive extraction + decode + PNG encode) wait for the
+  /// Queued generations (archive extraction + decode + thumbnail encode) wait for the
   /// scroll to stop instead of competing with the UI and raster threads for the
   /// CPU. Work that is already running is never interrupted, and the wait is
   /// bounded ([_scrollWaitCeiling]).
@@ -177,7 +184,8 @@ class ComicCoverService {
     _failed.remove(comicId);
     try {
       final Directory dir = await _dir();
-      await _deleteQuietly(File(_pngPath(dir, comicId)));
+      await _deleteQuietly(File(_imagePath(dir, comicId, 'jpg')));
+      await _deleteQuietly(File(_imagePath(dir, comicId, 'png')));
       await _deleteQuietly(File(_metaPath(dir, comicId)));
     } catch (e) {
       debugPrint('ComicCoverService.delete failed for $comicId: $e');
@@ -228,17 +236,29 @@ class ComicCoverService {
 
   Future<ComicCover?> _generateFromArchive(ComicIdentity comic) async {
     // Not marked as failed: the file may reappear (or be re-imported).
-    if (!await File(comic.sourcePath).exists()) return null;
+    if (!comic.isContentUri && !await File(comic.sourcePath).exists()) {
+      return null;
+    }
 
     LoadedComic? loaded;
     try {
-      loaded = await ComicParserService.loadComic(comic.sourcePath);
+      // Only page 0 is needed: a .cbr unpacked for it must not stay in the
+      // CBR cache once [loaded] is closed below.
+      loaded = await ComicParserService.loadComic(
+        comic.sourcePath,
+        retainCbrCache: false,
+      );
       final int pageCount = loaded.source.pageCount;
       if (pageCount <= 0) {
         throw const FormatException('Archive contains no image pages');
       }
       final Uint8List page0 = await loaded.source.readPage(0);
       return await _buildAndStore(comic.id, page0, pageCount);
+    } on FileSystemException catch (e) {
+      // Missing or unreadable source (including revoked/moved content:// URIs):
+      // leave out of _failed so it can recover if the file is restored.
+      debugPrint('ComicCoverService: source unreadable for ${comic.id}: $e');
+      return null;
     } catch (e, st) {
       _failed.add(comic.id);
       debugPrint('ComicCoverService: cover failed for ${comic.id}: $e\n$st');
@@ -279,8 +299,8 @@ class ComicCoverService {
 
   static String _safe(String id) => id.replaceAll(_unsafeChars, '_');
 
-  static String _pngPath(Directory dir, String id) =>
-      '${dir.path}${Platform.pathSeparator}${_safe(id)}.png';
+  static String _imagePath(Directory dir, String id, String ext) =>
+      '${dir.path}${Platform.pathSeparator}${_safe(id)}.$ext';
 
   static String _metaPath(Directory dir, String id) =>
       '${dir.path}${Platform.pathSeparator}${_safe(id)}.json';
@@ -291,7 +311,6 @@ class ComicCoverService {
 
     try {
       final Directory dir = await _dir();
-      final File png = File(_pngPath(dir, id));
 
       // One read instead of exists() + read: a missing record (the common case
       // while a big library is first scrolled) costs a single failed open.
@@ -299,7 +318,7 @@ class ComicCoverService {
         (String value) => value,
         onError: (Object _) => '',
       );
-      if (raw.isEmpty || !await png.exists()) return null;
+      if (raw.isEmpty) return null;
 
       final Object? parsed = jsonDecode(raw);
       if (parsed is! Map) return null;
@@ -309,8 +328,17 @@ class ComicCoverService {
         return null;
       }
 
+      // Records written before JPEG covers existed have no 'ext': those
+      // covers are PNGs and keep loading without regeneration.
+      final Object? storedExt = parsed['ext'];
+      final String ext =
+          storedExt is String && storedExt.isNotEmpty ? storedExt : 'png';
+
+      final File img = File(_imagePath(dir, id, ext));
+      if (!await img.exists()) return null;
+
       final ComicCover cover = ComicCover(
-        path: png.path,
+        path: img.path,
         pageCount: pages.toInt(),
       );
       _memo[id] = cover;
@@ -326,31 +354,41 @@ class ComicCoverService {
     Uint8List page0,
     int pageCount,
   ) async {
-    final Uint8List png = await _downscaleToPng(page0);
+    final ({Uint8List bytes, String ext}) encoded = await _encodeThumbnail(page0);
     final Directory dir = await _dir();
 
-    final String pngPath = _pngPath(dir, id);
+    final String imgPath = _imagePath(dir, id, encoded.ext);
     final String metaPath = _metaPath(dir, id);
     final String stamp = DateTime.now().microsecondsSinceEpoch.toString();
-    final File tmpPng = File('$pngPath.$stamp.tmp');
+    final File tmpImg = File('$imgPath.$stamp.tmp');
     final File tmpMeta = File('$metaPath.$stamp.tmp');
 
     try {
-      await tmpPng.writeAsBytes(png, flush: true);
+      await tmpImg.writeAsBytes(encoded.bytes, flush: true);
       await tmpMeta.writeAsString(
-        jsonEncode(<String, Object>{'v': _metaVersion, 'pages': pageCount}),
+        jsonEncode(<String, Object>{
+          'v': _metaVersion,
+          'pages': pageCount,
+          'ext': encoded.ext,
+        }),
         flush: true,
       );
       // Rename into place, metadata last: it is the "record is complete" marker.
-      await tmpPng.rename(pngPath);
+      await tmpImg.rename(imgPath);
       await tmpMeta.rename(metaPath);
     } catch (_) {
-      await _deleteQuietly(tmpPng);
+      await _deleteQuietly(tmpImg);
       await _deleteQuietly(tmpMeta);
       rethrow;
     }
 
-    final ComicCover cover = ComicCover(path: pngPath, pageCount: pageCount);
+    // The record now points at the new image; a legacy PNG left by an older
+    // version is dead weight.
+    if (encoded.ext != 'png') {
+      await _deleteQuietly(File(_imagePath(dir, id, 'png')));
+    }
+
+    final ComicCover cover = ComicCover(path: imgPath, pageCount: pageCount);
     _memo[id] = cover;
     _failed.remove(id);
     return cover;
@@ -369,12 +407,11 @@ class ComicCoverService {
     );
   }
 
-  /// Reads only the header to learn the page size, then opens a codec that
-  /// decodes straight to the bounded thumbnail size. For JPEG/WebP the engine
-  /// can scale inside the decoder, so the full-resolution bitmap is never
-  /// materialised; for PNG pages the decoder still needs the full bitmap
-  /// transiently, which is why the stored result is also area-bounded.
-  static Future<ui.Codec> _openThumbnailCodec(Uint8List bytes) async {
+  /// Decodes page 0 into a bounded thumbnail image. When page 0 is a wide
+  /// two-page spread (`width > height`), only the right half (the front cover
+  /// on wrap-around / manga covers) is kept and scaled to the cover budget so
+  /// the library tile never stretches a low-resolution center crop.
+  static Future<ui.Image> _decodeThumbnailImage(Uint8List bytes) async {
     final ui.ImmutableBuffer buffer = await ui.ImmutableBuffer.fromUint8List(
       bytes,
     );
@@ -382,40 +419,120 @@ class ComicCoverService {
       final ui.ImageDescriptor descriptor = await ui.ImageDescriptor.encoded(
         buffer,
       );
+      final bool isWideSpread =
+          descriptor.width > 0 &&
+              descriptor.height > 0 &&
+              descriptor.width > descriptor.height;
+      final int sourceWidth = isWideSpread
+          ? math.max(1, descriptor.width ~/ 2)
+          : descriptor.width;
+      final _CoverSize target = _fitCover(sourceWidth, descriptor.height);
+
+      final ui.Codec codec;
       try {
-        final _CoverSize target = _fitCover(descriptor.width, descriptor.height);
         // The codec keeps its own reference to the descriptor.
-        return await descriptor.instantiateCodec(
-          targetWidth: target.width,
+        codec = await descriptor.instantiateCodec(
+          targetWidth: isWideSpread ? target.width * 2 : target.width,
           targetHeight: target.height,
         );
       } catch (_) {
         descriptor.dispose();
         rethrow;
       }
+
+      try {
+        final ui.FrameInfo frame = await codec.getNextFrame();
+        final ui.Image decoded = frame.image;
+        if (!isWideSpread) return decoded;
+
+        try {
+          final ui.PictureRecorder recorder = ui.PictureRecorder();
+          final ui.Canvas canvas = ui.Canvas(recorder);
+          final double srcLeft = decoded.width / 2.0;
+          canvas.drawImageRect(
+            decoded,
+            ui.Rect.fromLTWH(
+              srcLeft,
+              0,
+              decoded.width - srcLeft,
+              decoded.height.toDouble(),
+            ),
+            ui.Rect.fromLTWH(
+              0,
+              0,
+              target.width.toDouble(),
+              target.height.toDouble(),
+            ),
+            ui.Paint()..filterQuality = ui.FilterQuality.high,
+          );
+          final ui.Picture picture = recorder.endRecording();
+          try {
+            return await picture.toImage(target.width, target.height);
+          } finally {
+            picture.dispose();
+          }
+        } finally {
+          decoded.dispose();
+        }
+      } finally {
+        codec.dispose();
+      }
     } finally {
       buffer.dispose();
     }
   }
 
-  /// Decodes at the bounded thumbnail size and re-encodes as PNG. Both steps
-  /// run on engine worker threads, not the UI isolate.
-  static Future<Uint8List> _downscaleToPng(Uint8List bytes) async {
-    final ui.Codec codec = await _openThumbnailCodec(bytes);
+  /// Decodes at the bounded thumbnail size and re-encodes it compactly.
+  ///
+  /// On Android the raw RGBA pixels go to the native JPEG encoder
+  /// (`compressThumbnail` in MainActivity.kt, quality 82, typically 15-25 KB).
+  /// Anywhere else, or if that call fails (e.g. no platform channel in
+  /// widget/unit tests), the thumbnail is encoded as lossless PNG instead.
+  /// Decoding and encoding run on engine/native worker threads, not the UI
+  /// isolate.
+  static Future<({Uint8List bytes, String ext})> _encodeThumbnail(
+      Uint8List bytes,
+      ) async {
+    final ui.Image image = await _decodeThumbnailImage(bytes);
     try {
-      final ui.FrameInfo frame = await codec.getNextFrame();
-      final ui.Image image = frame.image;
-      try {
-        final ByteData? data = await image.toByteData(
-          format: ui.ImageByteFormat.png,
-        );
-        if (data == null) throw StateError('PNG encoding returned no data');
-        return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
-      } finally {
-        image.dispose();
+      if (Platform.isAndroid) {
+        try {
+          final ByteData? rgba = await image.toByteData(
+            format: ui.ImageByteFormat.rawRgba,
+          );
+          if (rgba != null) {
+            final Uint8List? compressed =
+            await _safChannel.invokeMethod<Uint8List>(
+              'compressThumbnail',
+              <String, Object>{
+                'rgba': rgba.buffer.asUint8List(
+                  rgba.offsetInBytes,
+                  rgba.lengthInBytes,
+                ),
+                'width': image.width,
+                'height': image.height,
+                'quality': 88,
+              },
+            );
+            if (compressed != null && compressed.isNotEmpty) {
+              return (bytes: compressed, ext: 'jpg');
+            }
+          }
+        } catch (e) {
+          debugPrint('ComicCoverService: JPEG encode unavailable, using PNG: $e');
+        }
       }
+
+      final ByteData? png = await image.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
+      if (png == null) throw StateError('PNG encoding returned no data');
+      return (
+      bytes: png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
+      ext: 'png',
+      );
     } finally {
-      codec.dispose();
+      image.dispose();
     }
   }
 
