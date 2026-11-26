@@ -21,12 +21,29 @@
 
 namespace panelshift {
 
+// A pre-merge rectangle (normalised, like Box). Kept separate from Box so a Box
+// never contains Boxes.
+struct PartRect {
+  float x;
+  float y;
+  float w;
+  float h;
+};
+
 struct Box {
   float x;
   float y;
   float w;
   float h;
   float score;
+  // The ORIGINAL (pre-merge) rectangles this box was merged from, flattened: a
+  // box merged from a box that was itself a merge result lists the leaves, not
+  // the intermediate union. Empty for a box that was never merged. Set by
+  // merge_fragments() only; it is display metadata and no stage reads it, so it
+  // cannot change which boxes come out. It is deliberately the LAST member and
+  // has no default initializer, so `Box{x, y, w, h, score}` still compiles and
+  // leaves it empty.
+  std::vector<PartRect> parts;
 
   float right() const { return x + w; }
   float bottom() const { return y + h; }
@@ -239,11 +256,28 @@ inline std::size_t drop_union_boxes(std::vector<Box>& boxes, const Params& p) {
   return dropped;
 }
 
+namespace detail {
+
+// Appends the original rectangles that `b` stands for: the ones already recorded
+// when `b` is a merge result, otherwise its own rectangle.
+inline void append_constituents(const Box& b, std::vector<PartRect>& out) {
+  if (b.parts.empty()) {
+    out.push_back(PartRect{b.x, b.y, b.w, b.h});
+  } else {
+    out.insert(out.end(), b.parts.begin(), b.parts.end());
+  }
+}
+
+}  // namespace detail
+
 // Merges fragments of the same panel.
 //  * Largest boxes first, so the result does not depend on detector order.
 //  * Repeats until nothing changes: a merge enlarges a box, and the enlarged
 //    box can now overlap a third fragment that the old single pass never
 //    revisited.
+//  * Every merge also records the original rectangles in Box::parts (flattened,
+//    in merge order). This is bookkeeping only: should_merge(), bounding_box()
+//    and the loop structure are exactly as before.
 inline std::vector<Box> merge_fragments(std::vector<Box> boxes, const Params& p) {
   std::stable_sort(boxes.begin(), boxes.end(),
                    [](const Box& a, const Box& b) { return a.area() > b.area(); });
@@ -254,7 +288,11 @@ inline std::vector<Box> merge_fragments(std::vector<Box> boxes, const Params& p)
     for (std::size_t i = 0; i < boxes.size(); ++i) {
       for (std::size_t j = i + 1; j < boxes.size();) {
         if (should_merge(boxes[i], boxes[j], p)) {
+          std::vector<PartRect> parts;
+          detail::append_constituents(boxes[i], parts);
+          detail::append_constituents(boxes[j], parts);
           boxes[i] = bounding_box(boxes[i], boxes[j]);
+          boxes[i].parts = std::move(parts);
           boxes.erase(boxes.begin() + static_cast<std::ptrdiff_t>(j));
           changed = true;
         } else {

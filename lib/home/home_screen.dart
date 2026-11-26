@@ -850,6 +850,20 @@ class ComicProcessorScreenState extends State<ComicProcessorScreen> {
       );
       if (picked == null) return;
 
+      if (LibraryFileOps.isZipArchive(picked.sourcePath)) {
+        if (mounted) {
+          setState(() => _busyMessage = 'Extracting .zip archive...');
+        }
+        final ({List<FolderComicEntry> entries, String folderName})? scan =
+        await LibraryFileOps.extractAndScanZipComic(
+          picked.sourcePath,
+          notify: _notify,
+        );
+        if (scan == null) return;
+        await _importFolderEntries(scan.entries, scan.folderName);
+        return;
+      }
+
       if (mounted) {
         setState(() => _busyMessage = 'Importing comic into library...');
       }

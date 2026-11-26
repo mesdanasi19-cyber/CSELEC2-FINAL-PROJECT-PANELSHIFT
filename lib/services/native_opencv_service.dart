@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:ui' show Rect;
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
@@ -16,35 +17,58 @@ class ComicPanel {
   final double width;
   final double height;
 
+  /// The pre-merge rectangles (normalised 0..1, like [x]/[y]/[width]/[height])
+  /// this panel was merged from. Empty for a panel that was never merged.
+  /// Display metadata only: navigation and zoom use the outer panel alone.
+  final List<Rect> mergedSubPanels;
+
   const ComicPanel({
     required this.x,
     required this.y,
     required this.width,
     required this.height,
+    this.mergedSubPanels = const <Rect>[],
   });
 
   @override
-  String toString() => 'ComicPanel(x: $x, y: $y, w: $width, h: $height)';
+  String toString() =>
+      'ComicPanel(x: $x, y: $y, w: $width, h: $height, '
+      'sub: ${mergedSubPanels.length})';
 }
+
+/// Layout of the buffer filled by native `process_comic_panels_ex`: one record
+/// of [kPanelRecordStride] floats per panel,
+///   [x, y, w, h, subCount, sx0, sy0, sw0, sh0, sx1, ...]
+/// with room for [kMaxSubPanelsPerPanel] sub-rectangles. This side passes
+/// [kMaxSubPanelsPerPanel] to native, which derives the same stride from it, so
+/// the two can never disagree. Unused sub slots are zero.
+const int kMaxSubPanelsPerPanel = 12;
+const int kPanelRecordStride = 5 + 4 * kMaxSubPanelsPerPanel;
 
 // Native ABI. `initYoloModel` now returns 1 (loaded) / 0 (failed) instead of void.
 typedef InitYoloC = Int32 Function(Pointer<Utf8> modelPath);
 typedef InitYoloDart = int Function(Pointer<Utf8> modelPath);
 
+// `process_comic_panels_ex` writes panel records (see kPanelRecordStride) and
+// never writes past `bufferFloats` floats of `outBuffer`.
 typedef ProcessComicPanelsC = Int32 Function(
   Pointer<Uint8> pixelData,
   Int32 width,
   Int32 height,
-  Pointer<Float> outRects,
+  Pointer<Float> outBuffer,
   Int32 maxPanels,
+  Int32 maxSubPanels,
+  Int32 bufferFloats,
 );
 
 typedef ProcessComicPanelsDart = int Function(
   Pointer<Uint8> pixelData,
   int width,
   int height,
-  Pointer<Float> outRects,
+  Pointer<Float> outBuffer,
   int maxPanels,
+  int maxSubPanels,
+  int bufferFloats,
 );
 
 /// Symbol lookups for one isolate. Dart statics are per-isolate, so the UI
@@ -60,7 +84,7 @@ class _NativeBindings {
     final DynamicLibrary lib = DynamicLibrary.open('libpanelshift_core.so');
     _init = lib.lookupFunction<InitYoloC, InitYoloDart>('initYoloModel');
     _process = lib.lookupFunction<ProcessComicPanelsC, ProcessComicPanelsDart>(
-      'process_comic_panels',
+      'process_comic_panels_ex',
     );
   }
 
@@ -76,8 +100,8 @@ class _NativeBindings {
     }
   }
 
-  /// Returns a flat [x, y, w, h, ...] list of normalised (0..1) rectangles.
-
+  /// Returns `count * kPanelRecordStride` floats: one panel record per panel
+  /// (normalised 0..1 rectangle plus its merged sub-rectangles).
   Float32List detect(Uint8List rgba, int width, int height, int maxPanels) {
     if (rgba.isEmpty || width <= 0 || height <= 0 || maxPanels <= 0) {
       return Float32List(0);
@@ -98,18 +122,29 @@ class _NativeBindings {
     try {
       // Allocate inside try so a failure in the second allocation
       // cannot leak the first allocation.
+      final int outFloats = maxPanels * kPanelRecordStride;
       pixelPtr = malloc<Uint8>(rgba.length);
-      outPtr = malloc<Float>(maxPanels * 4);
+      outPtr = malloc<Float>(outFloats);
 
       pixelPtr.asTypedList(rgba.length).setAll(0, rgba);
 
-      int count = _process(pixelPtr, width, height, outPtr, maxPanels);
+      int count = _process(
+        pixelPtr,
+        width,
+        height,
+        outPtr,
+        maxPanels,
+        kMaxSubPanelsPerPanel,
+        outFloats,
+      );
 
       if (count < 0) count = 0;
       if (count > maxPanels) count = maxPanels;
 
       // Copy the result before freeing native memory.
-      return Float32List.fromList(outPtr.asTypedList(count * 4));
+      return Float32List.fromList(
+        outPtr.asTypedList(count * kPanelRecordStride),
+      );
     } finally {
       if (pixelPtr != null) {
         malloc.free(pixelPtr);
@@ -260,18 +295,41 @@ class NativeOpenCvService {
     );
   }
 
+  /// Decodes the worker's result: [kPanelRecordStride] floats per panel.
   static List<ComicPanel> panelsFromFlat(Float32List? flat) {
-    if (flat == null || flat.length < 4) return const <ComicPanel>[];
-    final int count = flat.length ~/ 4;
-    return List<ComicPanel>.generate(
-      count,
-      (int i) => ComicPanel(
-        x: flat[i * 4],
-        y: flat[i * 4 + 1],
-        width: flat[i * 4 + 2],
-        height: flat[i * 4 + 3],
-      ),
-      growable: false,
-    );
+    if (flat == null || flat.length < kPanelRecordStride) {
+      return const <ComicPanel>[];
+    }
+    final int count = flat.length ~/ kPanelRecordStride;
+    return List<ComicPanel>.generate(count, (int i) {
+      final int base = i * kPanelRecordStride;
+      return ComicPanel(
+        x: flat[base],
+        y: flat[base + 1],
+        width: flat[base + 2],
+        height: flat[base + 3],
+        mergedSubPanels: _subPanelsOf(flat, base),
+      );
+    }, growable: false);
+  }
+
+  static List<Rect> _subPanelsOf(Float32List flat, int base) {
+    final double declared = flat[base + 4];
+    if (!declared.isFinite || declared < 1) return const <Rect>[];
+    final int n = declared > kMaxSubPanelsPerPanel
+        ? kMaxSubPanelsPerPanel
+        : declared.round();
+
+    final List<Rect> subs = <Rect>[];
+    for (int k = 0; k < n; k++) {
+      final int o = base + 5 + 4 * k;
+      final double x = flat[o];
+      final double y = flat[o + 1];
+      final double w = flat[o + 2];
+      final double h = flat[o + 3];
+      if (!x.isFinite || !y.isFinite || !(w > 0.0) || !(h > 0.0)) continue;
+      subs.add(Rect.fromLTWH(x, y, w, h));
+    }
+    return subs.isEmpty ? const <Rect>[] : List<Rect>.unmodifiable(subs);
   }
 }

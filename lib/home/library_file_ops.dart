@@ -1,7 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -316,6 +319,8 @@ class LibraryFileOps {
       }
 
       final String pickedName = (picked['fileName'] as String?) ?? '';
+      _lastPickedUri = uri;
+      _lastPickedName = pickedName;
       if (!_hasSupportedExtension(pickedName)) {
         notify('Please select a .cbz, .zip, .cbr, or .rar file.');
         return null;
@@ -355,6 +360,12 @@ class LibraryFileOps {
     }
     return ComicIdentity.fromFile(path);
   }
+
+  // The Android picker reports the display name separately from the URI
+  // (a content:// URI does not always end in ".zip"), so the last pick is
+  // remembered for [isZipArchive].
+  static String _lastPickedUri = '';
+  static String _lastPickedName = '';
 
   static bool _hasSupportedExtension(String name) =>
       _supportedExtensions.contains(name.split('.').last.toLowerCase());
@@ -460,17 +471,26 @@ class LibraryFileOps {
     required String groupName,
   }) async {
     try {
-      final SafUriStat? info = await SafUriByteReader.stat(entry.uri);
-      if (info == null) {
-        debugPrint('PanelShift: "${entry.path}" is not readable, skipped.');
-        return false;
+      final ComicIdentity comic;
+      if (entry.uri.startsWith('content://')) {
+        final SafUriStat? info = await SafUriByteReader.stat(entry.uri);
+        if (info == null) {
+          debugPrint('PanelShift: "${entry.path}" is not readable, skipped.');
+          return false;
+        }
+        comic = ComicIdentity.fromUri(
+          uri: entry.uri,
+          fileName: info.fileName.isEmpty ? entry.fileName : info.fileName,
+          fileSize: info.size,
+          md5Prefix: info.md5Prefix,
+        ).copyWith(groupId: groupId, groupName: groupName);
+      } else {
+        // Desktop .zip import: entries are plain file paths, read in place.
+        final ComicIdentity fromDisk = await Future<ComicIdentity>.value(
+          ComicIdentity.fromFile(entry.uri),
+        );
+        comic = fromDisk.copyWith(groupId: groupId, groupName: groupName);
       }
-      final ComicIdentity comic = ComicIdentity.fromUri(
-        uri: entry.uri,
-        fileName: info.fileName.isEmpty ? entry.fileName : info.fileName,
-        fileSize: info.size,
-        md5Prefix: info.md5Prefix,
-      ).copyWith(groupId: groupId, groupName: groupName);
 
       // Cover first (a no-op when one exists). This opens the archive in place
       // and also records its page count; the reference is released right away.
@@ -494,6 +514,166 @@ class LibraryFileOps {
       debugPrint('PanelShift: folder import failed for "${entry.path}": $e');
       return false;
     }
+  }
+
+  // ===========================================================================
+  // .zip comic packs ("Import a comic" with a .zip)
+  // ===========================================================================
+
+  /// Whether [nameOrUri] is a `.zip` file. Pass the picked comic's
+  /// `sourcePath` (or its file name). A `content://` URI does not always end
+  /// in the file name, so the display name reported by the last
+  /// [pickSingleComic] is used for that URI.
+  static bool isZipArchive(String nameOrUri) {
+    String text = nameOrUri;
+    if (nameOrUri.startsWith('content://') &&
+        nameOrUri == _lastPickedUri &&
+        _lastPickedName.isNotEmpty) {
+      text = _lastPickedName;
+    }
+    try {
+      text = Uri.decodeComponent(text);
+    } catch (_) {}
+    return text.trim().toLowerCase().endsWith('.zip');
+  }
+
+  /// Extracts a picked `.zip` next to itself, deletes it once at least one
+  /// comic came out, and lists the comics for a one-shelf folder-style import.
+  ///
+  /// The `.zip` is extracted into `<its folder>/<zip name>/` (a "(1)" suffix
+  /// if that exists). Nested `.cbz/.cbr/.zip/.rar` files are copied with their
+  /// relative paths; a `.zip` with only page images gets one stored `.cbz` per
+  /// image folder. On failure or when nothing is found, the partial folder is
+  /// removed and the `.zip` stays. Returns the entries in natural order of
+  /// their relative path plus the zip's base name, or null ([notify] gets the
+  /// reason). Hand the result to the folder import as it is: one group, one
+  /// shelf.
+  static Future<({List<FolderComicEntry> entries, String folderName})?>
+  extractAndScanZipComic(
+    String sourcePath, {
+    required void Function(String message) notify,
+  }) async {
+    try {
+      return Platform.isAndroid
+          ? await _extractZipAndroid(sourcePath, notify)
+          : await _extractZipDesktop(sourcePath, notify);
+    } on PlatformException catch (e) {
+      debugPrint('PanelShift: zip extraction failed: ${e.code} ${e.message}');
+      notify(e.message ?? 'Could not extract the .zip file.');
+      return null;
+    } on FileSystemException catch (e) {
+      debugPrint('PanelShift: zip extraction failed: $e');
+      notify(
+        e.message.isEmpty ? 'Could not extract the .zip file.' : e.message,
+      );
+      return null;
+    } catch (e) {
+      debugPrint('PanelShift: zip extraction failed: $e');
+      notify('Could not extract the .zip file.');
+      return null;
+    }
+  }
+
+  static List<FolderComicEntry> _entriesFromReply(Map<String, dynamic> reply) {
+    final List<FolderComicEntry> found = <FolderComicEntry>[];
+    final List<Object?> rawFiles =
+        (reply['files'] as List<Object?>?) ?? const <Object?>[];
+    for (final Object? raw in rawFiles) {
+      if (raw is! Map<Object?, Object?>) continue;
+      final String? uri = raw['uri'] as String?;
+      final String? fileName = raw['fileName'] as String?;
+      if (uri == null || uri.isEmpty || fileName == null || fileName.isEmpty) {
+        continue;
+      }
+      if (!_supportedExtensions.contains(fileName.split('.').last.toLowerCase())) {
+        continue;
+      }
+      found.add(
+        FolderComicEntry(
+          uri: uri,
+          fileName: fileName,
+          path: (raw['path'] as String?) ?? fileName,
+          size: (raw['size'] as num?)?.toInt() ?? -1,
+        ),
+      );
+    }
+    return found;
+  }
+
+  static Future<({List<FolderComicEntry> entries, String folderName})?>
+  _extractZipAndroid(
+    String sourcePath,
+    void Function(String message) notify,
+  ) async {
+    // Can wait on the user: the folder-access picker may open first.
+    final Map<String, dynamic>? reply = await _safChannel
+        .invokeMapMethod<String, dynamic>(
+          'extractZipToOriginalFolder',
+          <String, Object?>{'uri': sourcePath},
+        );
+    if (reply == null) {
+      notify('Extraction cancelled.');
+      return null;
+    }
+
+    final List<FolderComicEntry> found = _entriesFromReply(reply);
+    if (found.isEmpty) {
+      notify('No comics or page images found in that .zip. It was left as it is.');
+      return null;
+    }
+    if (reply['zipDeleted'] == false) {
+      notify('Extracted, but the original .zip could not be deleted.');
+    }
+
+    String folderName = ((reply['folderName'] as String?) ?? '').trim();
+    if (folderName.isEmpty) folderName = 'Imported Zip';
+    return (
+      entries: ComicParserService.sortNaturally(
+        found,
+        (FolderComicEntry entry) => entry.path,
+      ),
+      folderName: folderName,
+    );
+  }
+
+  static Future<({List<FolderComicEntry> entries, String folderName})?>
+  _extractZipDesktop(
+    String sourcePath,
+    void Function(String message) notify,
+  ) async {
+    final File zipFile = File(sourcePath);
+    if (!await zipFile.exists()) {
+      notify('Selected file could not be found on disk.');
+      return null;
+    }
+
+    final _DesktopZipResult result = await Isolate.run(
+      () => _extractZipOnDesktop(sourcePath),
+    );
+    if (result.files.isEmpty) {
+      notify('No comics or page images found in that .zip. It was left as it is.');
+      return null;
+    }
+    if (!result.zipDeleted) {
+      notify('Extracted, but the original .zip could not be deleted.');
+    }
+
+    final List<FolderComicEntry> found = <FolderComicEntry>[
+      for (final _DesktopZipFile file in result.files)
+        FolderComicEntry(
+          uri: file.path,
+          fileName: file.path.split(RegExp(r'[\\/]')).last,
+          path: file.relative,
+          size: file.size,
+        ),
+    ];
+    return (
+      entries: ComicParserService.sortNaturally(
+        found,
+        (FolderComicEntry entry) => entry.path,
+      ),
+      folderName: result.zipBaseName,
+    );
   }
 
   /// Comics that show the "Finished" badge: their saved position is on the
@@ -589,5 +769,284 @@ class LibraryFileOps {
       }
     });
     return (ok: ok, externalProtected: externalProtected);
+  }
+}
+
+
+// =============================================================================
+// Desktop .zip extraction (runs in a background isolate; dart:io only)
+// =============================================================================
+
+class _DesktopZipFile {
+  const _DesktopZipFile(this.path, this.relative, this.size);
+
+  final String path;
+  final String relative;
+  final int size;
+}
+
+class _DesktopZipResult {
+  const _DesktopZipResult({
+    required this.zipBaseName,
+    required this.files,
+    required this.zipDeleted,
+  });
+
+  final String zipBaseName;
+  final List<_DesktopZipFile> files;
+  final bool zipDeleted;
+}
+
+final RegExp _unsafeFileNameChars = RegExp(r'[\\/:*?"<>|]');
+
+String _cleanZipSegment(String segment) {
+  final String cleaned = segment.replaceAll(_unsafeFileNameChars, '_').trim();
+  return cleaned.isEmpty ? '_' : cleaned;
+}
+
+/// Extracts [zipPath] into `<its folder>/<zip name>/`. Never leaves a partial
+/// folder behind and deletes the `.zip` only after at least one comic exists.
+_DesktopZipResult _extractZipOnDesktop(String zipPath) {
+  final File zipFile = File(zipPath);
+  final String zipName = zipPath.split(RegExp(r'[\\/]')).last;
+  final String rawBase = zipName.toLowerCase().endsWith('.zip')
+      ? zipName.substring(0, zipName.length - 4).trim()
+      : zipName.trim();
+  final String zipBaseName = rawBase.isEmpty ? 'Comic' : rawBase;
+  final String folderBase = _cleanZipSegment(zipBaseName);
+
+  // The whole archive is read once; entries are decompressed one at a time.
+  final Archive archive = ZipDecoder().decodeBytes(zipFile.readAsBytesSync());
+
+  // Zip Slip: refuse the whole archive if any entry climbs out with "..".
+  final List<ArchiveFile> nestedArchives = <ArchiveFile>[];
+  final Map<String, List<ArchiveFile>> imageFolders =
+      <String, List<ArchiveFile>>{};
+  for (final ArchiveFile file in archive.files) {
+    if (!file.isFile) continue;
+    final List<String> parts = ComicParserService.normalizeEntryPath(file.name)
+        .split('/')
+        .where((String part) => part.isNotEmpty && part != '.')
+        .toList(growable: false);
+    if (parts.any((String part) => part == '..')) {
+      throw const FileSystemException(
+        'The .zip contains an unsafe path ("..") and was not imported.',
+      );
+    }
+    if (parts.isEmpty) continue;
+    if (ComicParserService.isComicArchivePath(file.name)) {
+      nestedArchives.add(file);
+    } else if (ComicParserService.isPageImagePath(file.name)) {
+      imageFolders
+          .putIfAbsent(parts.take(parts.length - 1).join('/'), () => <ArchiveFile>[])
+          .add(file);
+    }
+  }
+  if (nestedArchives.isEmpty && imageFolders.isEmpty) {
+    return _DesktopZipResult(
+      zipBaseName: zipBaseName,
+      files: const <_DesktopZipFile>[],
+      zipDeleted: false,
+    );
+  }
+
+  final Directory parent = zipFile.parent;
+  final String sep = Platform.pathSeparator;
+  String destName = folderBase;
+  for (int n = 1;
+      Directory('${parent.path}$sep$destName').existsSync() ||
+          File('${parent.path}$sep$destName').existsSync();
+      n++) {
+    destName = '$folderBase ($n)';
+  }
+  final Directory dest = Directory('${parent.path}$sep$destName')..createSync();
+
+  final List<_DesktopZipFile> produced = <_DesktopZipFile>[];
+  bool succeeded = false;
+  try {
+    if (nestedArchives.isNotEmpty) {
+      // Case A: nested comic archives keep their relative paths.
+      for (final ArchiveFile file in nestedArchives) {
+        final List<String> parts =
+            ComicParserService.normalizeEntryPath(file.name)
+                .split('/')
+                .where((String part) => part.isNotEmpty && part != '.')
+                .map(_cleanZipSegment)
+                .toList(growable: false);
+        final String relative = parts.join('/');
+        final File out = File(
+          '${dest.path}$sep${parts.join(sep)}',
+        );
+        out.parent.createSync(recursive: true);
+        final Uint8List bytes = Uint8List.fromList(file.content as List<int>);
+        out.writeAsBytesSync(bytes, flush: true);
+        produced.add(_DesktopZipFile(out.path, relative, bytes.length));
+      }
+    } else {
+      // Case B: one stored .cbz per image folder.
+      final Map<String, String> names = _chooseCbzNames(
+        imageFolders.keys,
+        folderBase,
+      );
+      for (final MapEntry<String, List<ArchiveFile>> folder
+          in imageFolders.entries) {
+        final String cbzName = '${names[folder.key]}.cbz';
+        final File out = File('${dest.path}$sep$cbzName');
+        final int size = _writeStoredZip(out, folder.value);
+        produced.add(_DesktopZipFile(out.path, cbzName, size));
+      }
+    }
+
+    for (final _DesktopZipFile file in produced) {
+      if (!File(file.path).existsSync() || File(file.path).lengthSync() <= 0) {
+        throw FileSystemException('Extraction produced an empty file', file.path);
+      }
+    }
+    if (produced.isEmpty) {
+      return _DesktopZipResult(
+        zipBaseName: zipBaseName,
+        files: const <_DesktopZipFile>[],
+        zipDeleted: false,
+      );
+    }
+    succeeded = true;
+  } finally {
+    if (!succeeded) {
+      try {
+        dest.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+  }
+
+  bool deleted = false;
+  try {
+    zipFile.deleteSync();
+    deleted = true;
+  } catch (_) {}
+  return _DesktopZipResult(
+    zipBaseName: zipBaseName,
+    files: produced,
+    zipDeleted: deleted,
+  );
+}
+
+/// Leaf folder name per image folder; clashes fall back to the full path.
+Map<String, String> _chooseCbzNames(Iterable<String> keys, String baseName) {
+  String leaf(String key) => _cleanZipSegment(
+    key.isEmpty ? baseName : key.substring(key.lastIndexOf('/') + 1),
+  );
+
+  final Map<String, int> leafUse = <String, int>{};
+  for (final String key in keys) {
+    leafUse.update(leaf(key).toLowerCase(), (int n) => n + 1, ifAbsent: () => 1);
+  }
+  final Set<String> used = <String>{};
+  final Map<String, String> names = <String, String>{};
+  for (final String key in keys) {
+    String candidate = leaf(key);
+    if (key.isNotEmpty && (leafUse[candidate.toLowerCase()] ?? 0) > 1) {
+      candidate = _cleanZipSegment(key.replaceAll('/', ' - '));
+    }
+    String unique = candidate;
+    for (int n = 1; !used.add(unique.toLowerCase()); n++) {
+      unique = '$candidate ($n)';
+    }
+    names[key] = unique;
+  }
+  return names;
+}
+
+final List<int> _crcTable = List<int>.generate(256, (int n) {
+  int c = n;
+  for (int k = 0; k < 8; k++) {
+    c = (c & 1) != 0 ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+  }
+  return c;
+}, growable: false);
+
+int _crc32(List<int> data) {
+  int c = 0xFFFFFFFF;
+  for (final int byte in data) {
+    c = _crcTable[(c ^ byte) & 0xFF] ^ (c >> 8);
+  }
+  return c ^ 0xFFFFFFFF;
+}
+
+/// Writes [pages] as an uncompressed (STORED) zip, one page in memory at a
+/// time. Returns the file size.
+int _writeStoredZip(File target, List<ArchiveFile> pages) {
+  final RandomAccessFile raf = target.openSync(mode: FileMode.write);
+  final BytesBuilder central = BytesBuilder(copy: false);
+  final Set<String> usedNames = <String>{};
+  int offset = 0;
+  int count = 0;
+  try {
+    for (final ArchiveFile page in pages) {
+      final String clean = _cleanZipSegment(
+        ComicParserService.normalizeEntryPath(page.name).split('/').last,
+      );
+      String name = clean;
+      for (int n = 1; !usedNames.add(name.toLowerCase()); n++) {
+        final int dot = clean.lastIndexOf('.');
+        name = dot > 0
+            ? '${clean.substring(0, dot)} ($n)${clean.substring(dot)}'
+            : '$clean ($n)';
+      }
+      final Uint8List nameBytes = Uint8List.fromList(utf8.encode(name));
+      final List<int> data = page.content as List<int>;
+      final int crc = _crc32(data);
+
+      final ByteData local = ByteData(30)
+        ..setUint32(0, 0x04034b50, Endian.little)
+        ..setUint16(4, 20, Endian.little)
+        ..setUint16(6, 0x0800, Endian.little) // UTF-8 names
+        ..setUint16(8, 0, Endian.little) // stored
+        ..setUint16(10, 0, Endian.little)
+        ..setUint16(12, 33, Endian.little) // 1980-01-01
+        ..setUint32(14, crc, Endian.little)
+        ..setUint32(18, data.length, Endian.little)
+        ..setUint32(22, data.length, Endian.little)
+        ..setUint16(26, nameBytes.length, Endian.little)
+        ..setUint16(28, 0, Endian.little);
+      raf.writeFromSync(local.buffer.asUint8List());
+      raf.writeFromSync(nameBytes);
+      raf.writeFromSync(data);
+
+      final ByteData entry = ByteData(46)
+        ..setUint32(0, 0x02014b50, Endian.little)
+        ..setUint16(4, 20, Endian.little)
+        ..setUint16(6, 20, Endian.little)
+        ..setUint16(8, 0x0800, Endian.little)
+        ..setUint16(10, 0, Endian.little)
+        ..setUint16(12, 0, Endian.little)
+        ..setUint16(14, 33, Endian.little)
+        ..setUint32(16, crc, Endian.little)
+        ..setUint32(20, data.length, Endian.little)
+        ..setUint32(24, data.length, Endian.little)
+        ..setUint16(28, nameBytes.length, Endian.little)
+        ..setUint32(42, offset, Endian.little);
+      central
+        ..add(entry.buffer.asUint8List())
+        ..add(nameBytes);
+
+      offset += 30 + nameBytes.length + data.length;
+      count++;
+      if (offset > 0xFFFFFFF0 || count > 0xFFFF) {
+        throw FileSystemException('Image folder is too large for one .cbz', target.path);
+      }
+    }
+
+    final Uint8List directory = central.takeBytes();
+    raf.writeFromSync(directory);
+    final ByteData end = ByteData(22)
+      ..setUint32(0, 0x06054b50, Endian.little)
+      ..setUint16(8, count, Endian.little)
+      ..setUint16(10, count, Endian.little)
+      ..setUint32(12, directory.length, Endian.little)
+      ..setUint32(16, offset, Endian.little);
+    raf.writeFromSync(end.buffer.asUint8List());
+    return offset + directory.length + 22;
+  } finally {
+    raf.closeSync();
   }
 }

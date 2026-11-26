@@ -260,6 +260,22 @@ class ComicParserService {
   static List<T> sortNaturally<T>(List<T> items, String Function(T item) nameOf) =>
       _sortNaturally<T>(items, nameOf);
 
+  /// True for a loose page image (.jpg/.jpeg/.png/.webp) at any depth of an
+  /// archive path. Hidden entries and OS metadata folders/files are rejected,
+  /// exactly as when pages are indexed. Used by `.zip` pack import.
+  static bool isPageImagePath(String path) => _isPageImage(path);
+
+  /// True for a nested comic archive (.cbz/.cbr/.zip/.rar) at any depth of an
+  /// archive path, with the same hidden/metadata filtering as [isPageImagePath].
+  static bool isComicArchivePath(String path) {
+    final String? extension = _visibleEntryExtension(path);
+    return extension != null && _comicArchiveExtensions.contains(extension);
+  }
+
+  /// Archive entry path with '\\' turned into '/' and repeated slashes merged.
+  static String normalizeEntryPath(String path) =>
+      _normalizeArchiveEntryPath(path);
+
   /// Opens a .cbz/.zip/.cbr/.rar file or `content://` document (read in place,
   /// never copied; only .cbr/.rar is staged briefly for extraction). The format
   /// is detected from its magic
@@ -2138,6 +2154,38 @@ bool _isPageImage(String path) {
   if (extensionStart <= 0) return false;
   final String extension = lowerFileName.substring(extensionStart);
   return _supportedPageExtensions.contains(extension);
+}
+
+const Set<String> _comicArchiveExtensions = <String>{
+  '.cbz',
+  '.cbr',
+  '.zip',
+  '.rar',
+};
+
+/// Lower-case extension (with the dot) of a visible archive entry, or null for
+/// directories, hidden entries, OS metadata and `..` paths. Same filtering as
+/// [_isPageImage], without the page-image extension check.
+String? _visibleEntryExtension(String path) {
+  final String normalized = _normalizeArchiveEntryPath(path);
+  if (normalized.isEmpty || normalized.endsWith('/')) return null;
+  final List<String> segments = normalized
+      .split('/')
+      .where((String segment) => segment.isNotEmpty && segment != '.')
+      .toList(growable: false);
+  if (segments.isEmpty || segments.any((String part) => part == '..')) {
+    return null;
+  }
+  for (final String segment in segments) {
+    final String lower = segment.toLowerCase();
+    if (lower.startsWith('.')) return null;
+    if (_ignoredArchiveDirectories.contains(lower)) return null;
+  }
+  final String lowerFileName = segments.last.toLowerCase();
+  if (_ignoredArchiveMetadataFiles.contains(lowerFileName)) return null;
+  final int extensionStart = lowerFileName.lastIndexOf('.');
+  if (extensionStart <= 0) return null;
+  return lowerFileName.substring(extensionStart);
 }
 
 final RegExp _chunkPattern = RegExp(r'\d+|\D+');

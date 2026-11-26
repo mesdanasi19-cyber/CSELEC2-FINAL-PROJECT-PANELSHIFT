@@ -53,6 +53,13 @@ class ComicPanelPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 4.5;
 
+      // Constituent (pre-merge) rectangles of a merged panel: a different
+      // colour and a thinner stroke so they never hide the outer outline.
+      final subStrokePaint = Paint()
+        ..color = Colors.orangeAccent
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0;
+
       for (int i = 0; i < panels.length; i++) {
         final panel = panels[i];
         final rect = Rect.fromLTWH(
@@ -83,6 +90,39 @@ class ComicPanelPainter extends CustomPainter {
         )..layout();
 
         textPainter.paint(canvas, Offset(rect.left + 4, rect.top + 4));
+
+        // 3. Merged sub-panels, labelled #<outer>.<n>. Outline only: the outer
+        // panel stays the single camera stop.
+        for (int k = 0; k < panel.mergedSubPanels.length; k++) {
+          final sub = panel.mergedSubPanels[k];
+          final subRect = Rect.fromLTWH(
+            sub.left * size.width,
+            sub.top * size.height,
+            sub.width * size.width,
+            sub.height * size.height,
+          );
+          canvas.drawRect(subRect, subStrokePaint);
+
+          final subPainter = TextPainter(
+            text: TextSpan(
+              text: ' #${i + 1}.${k + 1} ',
+              style: const TextStyle(
+                color: Colors.black,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+                backgroundColor: Colors.orangeAccent,
+              ),
+            ),
+            textDirection: TextDirection.ltr,
+          )..layout();
+
+          // Bottom-left corner, so it never sits on the outer "#n" badge at
+          // the top-left of the outer box.
+          subPainter.paint(
+            canvas,
+            Offset(subRect.left + 3, subRect.bottom - subPainter.height - 3),
+          );
+        }
       }
     }
   }

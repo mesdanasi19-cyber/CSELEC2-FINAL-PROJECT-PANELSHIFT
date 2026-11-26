@@ -127,7 +127,7 @@ constexpr int kDnnThreads = 4;
 //  * Net::forward() runs under the lock and its result (a view into the net's own
 //    output buffer, valid until the next forward()) is fully consumed before the
 //    lock is released. No pointer into g_blob / g_small_rgba / g_gray or into the
-//    net's output ever leaves a locked section; the caller-owned out_rects is the
+//    net's output ever leaves a locked section; the caller-owned out_buffer is the
 //    only thing handed back.
 // Nothing is thread_local and nothing is freed by hand: the Mats own their memory
 // (reference counted by OpenCV) and live until process exit, so there is no raw
@@ -158,14 +158,44 @@ cv::Mat g_gray;
 inline float clamp01(float v) { return std::max(0.0f, std::min(1.0f, v)); }
 inline int clampi(int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); }
 
+// ---- Panel record layout (process_comic_panels_ex) ---------------------------
+// One fixed-size record of `stride = kRecordHeader + 4 * max_sub_panels` floats per
+// panel, so the caller can index panel i at i * stride and the native side can prove
+// that it never writes past the caller's buffer:
+//   [ x, y, w, h, sub_count, sx0, sy0, sw0, sh0, sx1, sy1, sw1, sh1, ... ]
+// All values are normalised 0..1, except sub_count (a whole number stored as float).
+// The sub rectangles are the pre-merge rectangles of a merged panel; sub_count is 0
+// for a panel that was never merged. Unused sub slots are zero-filled. If a panel has
+// more than max_sub_panels constituents, the first max_sub_panels are written.
+constexpr int kRecordHeader = 5;
+constexpr int kMaxSubPanelsCap = 64;  // sanity limit on the caller's max_sub_panels
+
+inline int record_stride(int max_sub_panels) { return kRecordHeader + 4 * max_sub_panels; }
+
+void write_record(float* rec, int stride, const panelshift::Box& b, int max_sub_panels) {
+    std::fill(rec, rec + stride, 0.0f);
+    rec[0] = b.x;
+    rec[1] = b.y;
+    rec[2] = b.w;
+    rec[3] = b.h;
+    const int n = std::min(static_cast<int>(b.parts.size()), max_sub_panels);
+    rec[4] = static_cast<float>(n);
+    for (int k = 0; k < n; ++k) {
+        float* s = rec + kRecordHeader + 4 * k;
+        s[0] = b.parts[static_cast<size_t>(k)].x;
+        s[1] = b.parts[static_cast<size_t>(k)].y;
+        s[2] = b.parts[static_cast<size_t>(k)].w;
+        s[3] = b.parts[static_cast<size_t>(k)].h;
+    }
+}
+
 // Whole page as a single panel: used for covers / splash pages and whenever
 // inference cannot run. Returns 0 (no panels) only if there is no output buffer.
-int write_full_page(float* out_rects, int max_panels) {
-    if (out_rects == nullptr || max_panels <= 0) return 0;
-    out_rects[0] = 0.0f;
-    out_rects[1] = 0.0f;
-    out_rects[2] = 1.0f;
-    out_rects[3] = 1.0f;
+// The caller guarantees room for one record of `stride` floats.
+int write_full_page(float* out_buffer, int max_panels, int stride, int max_sub_panels) {
+    if (out_buffer == nullptr || max_panels <= 0) return 0;
+    write_record(out_buffer, stride, panelshift::Box{0.0f, 0.0f, 1.0f, 1.0f, 1.0f, {}},
+                 max_sub_panels);
     return 1;
 }
 
@@ -265,29 +295,46 @@ Java_com_panelshift_engine_PanelShiftNativeBridge_detectDocumentCorners(
     return 1;
 }
 
-// 3. Runs YOLO on an RGBA page buffer (any size) and writes up to max_panels
-//    normalised rects (x, y, w, h) in reading order. Returns the panel count.
-//    Never throws and never returns 0 for a valid call: every failure path
-//    answers with the full page as one panel.
+// 3. Runs YOLO on an RGBA page buffer (any size) and writes up to max_panels panel
+//    records in reading order (layout: see "Panel record layout" above). Returns the
+//    panel count. Never throws and never returns 0 for a valid call: every failure
+//    path answers with the full page as one panel.
+//
+//    out_buffer must have room for buffer_floats floats. The record stride is
+//    4 + 1 + 4 * max_sub_panels floats, and the panel count is capped so that
+//    count * stride <= buffer_floats: the native side never writes past the buffer,
+//    whatever max_panels says. The caller picks max_sub_panels, so both sides always
+//    agree on the stride.
 __attribute__((visibility("default"))) __attribute__((used))
-int process_comic_panels(
+int process_comic_panels_ex(
         uint8_t* pixel_data,
         int width,
         int height,
-        float* out_rects,
-        int max_panels
+        float* out_buffer,
+        int max_panels,
+        int max_sub_panels,
+        int buffer_floats
 ) {
-    if (pixel_data == nullptr || out_rects == nullptr || width <= 0 || height <= 0 ||
-        max_panels <= 0 || width > kMaxImageEdge || height > kMaxImageEdge) {
-        LOGE("Invalid arguments passed to native core (w=%d h=%d max=%d).", width, height, max_panels);
+    if (max_sub_panels < 0 || max_sub_panels > kMaxSubPanelsCap) {
+        LOGE("Invalid max_sub_panels passed to native core (%d).", max_sub_panels);
         return 0;
     }
+    const int stride = record_stride(max_sub_panels);
+    if (pixel_data == nullptr || out_buffer == nullptr || width <= 0 || height <= 0 ||
+        max_panels <= 0 || width > kMaxImageEdge || height > kMaxImageEdge ||
+        buffer_floats < stride) {
+        LOGE("Invalid arguments passed to native core (w=%d h=%d max=%d buffer=%d stride=%d).",
+             width, height, max_panels, buffer_floats, stride);
+        return 0;
+    }
+    // The caller's buffer is the hard limit, not max_panels.
+    max_panels = std::min(max_panels, buffer_floats / stride);
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
     if (!g_net || g_net->empty()) {
         LOGE("YOLO model not loaded. Falling back to full-page panel.");
-        return write_full_page(out_rects, max_panels);
+        return write_full_page(out_buffer, max_panels, stride, max_sub_panels);
     }
 
     // A C++ exception must never cross the FFI boundary: it would abort the app.
@@ -319,7 +366,7 @@ int process_comic_panels(
         // class's row instead.)
         if (output.empty() || output.dims != 3 || output.depth() != CV_32F || output.size[0] != 1) {
             LOGE("Unexpected detection tensor (dims=%d). Falling back to full page.", output.dims);
-            return write_full_page(out_rects, max_panels);
+            return write_full_page(out_buffer, max_panels, stride, max_sub_panels);
         }
         const int d1 = output.size[1];
         const int d2 = output.size[2];
@@ -328,14 +375,14 @@ int process_comic_panels(
         const int cols = transposed ? d1 : d2;
         if (rows < 5 || cols <= 0 || cols > kMaxAnchors) {
             LOGE("Unexpected detection tensor shape [1,%d,%d]. Falling back to full page.", d1, d2);
-            return write_full_page(out_rects, max_panels);
+            return write_full_page(out_buffer, max_panels, stride, max_sub_panels);
         }
 
         const cv::Mat contiguous = output.isContinuous() ? output : output.clone();
         if (!contiguous.isContinuous() ||
             contiguous.total() < static_cast<size_t>(rows) * static_cast<size_t>(cols)) {
             LOGE("Detection tensor is smaller than its shape says. Falling back to full page.");
-            return write_full_page(out_rects, max_panels);
+            return write_full_page(out_buffer, max_panels, stride, max_sub_panels);
         }
         const float* data = reinterpret_cast<const float*>(contiguous.data);
 
@@ -369,7 +416,7 @@ int process_comic_panels(
             // Such a box can never be a panel and would only take one of the 300
             // candidate slots nms() keeps.
             if (!(x1 > x0) || !(y1 > y0)) continue;
-            candidates.push_back(panelshift::Box{x0, y0, x1 - x0, y1 - y0, confidence});
+            candidates.push_back(panelshift::Box{x0, y0, x1 - x0, y1 - y0, confidence, {}});
         }
         PS_COUNT(n_raw, candidates.size());
 
@@ -434,17 +481,17 @@ int process_comic_panels(
                                      static_cast<double>(covered));
 #endif
             boxes.clear();
-            boxes.push_back(panelshift::Box{0.0f, 0.0f, 1.0f, 1.0f, 1.0f});
+            boxes.push_back(panelshift::Box{0.0f, 0.0f, 1.0f, 1.0f, 1.0f, {}});
         }
 
         panelshift::sort_reading_order(boxes, params);
 
         const int panel_count = std::min(max_panels, static_cast<int>(boxes.size()));
+        // panel_count <= max_panels <= buffer_floats / stride (checked on entry), so
+        // every record written here lies inside the caller's buffer.
         for (int i = 0; i < panel_count; ++i) {
-            out_rects[i * 4 + 0] = boxes[i].x;
-            out_rects[i * 4 + 1] = boxes[i].y;
-            out_rects[i * 4 + 2] = boxes[i].w;
-            out_rects[i * 4 + 3] = boxes[i].h;
+            write_record(out_buffer + static_cast<size_t>(i) * static_cast<size_t>(stride), stride,
+                         boxes[static_cast<size_t>(i)], max_sub_panels);
         }
 
 #ifdef PANELSHIFT_PROFILE
@@ -457,9 +504,10 @@ int process_comic_panels(
         // artifacts survive (small and weak = a bubble or caption) shows up here.
         for (int i = 0; i < panel_count; ++i) {
             const panelshift::Box& b = boxes[i];
-            LOGI("  panel %d: x=%.3f y=%.3f w=%.3f h=%.3f area=%.3f score=%.2f", i,
+            LOGI("  panel %d: x=%.3f y=%.3f w=%.3f h=%.3f area=%.3f score=%.2f merged_parts=%zu", i,
                  static_cast<double>(b.x), static_cast<double>(b.y), static_cast<double>(b.w),
-                 static_cast<double>(b.h), static_cast<double>(b.w * b.h), static_cast<double>(b.score));
+                 static_cast<double>(b.h), static_cast<double>(b.w * b.h), static_cast<double>(b.score),
+                 b.parts.size());
         }
 #else
         LOGI("YOLO extracted %d comic panels.", panel_count);
@@ -472,7 +520,45 @@ int process_comic_panels(
     } catch (...) {
         LOGE("Unknown exception during inference.");
     }
-    return write_full_page(out_rects, max_panels);
+    return write_full_page(out_buffer, max_panels, stride, max_sub_panels);
+}
+
+// 4. Original ABI, kept so existing callers / desktop tests keep working: normalised
+//    (x, y, w, h) per panel, 4 floats each, no sub-panels. Runs the same pipeline
+//    through process_comic_panels_ex (with max_sub_panels = 0, i.e. 5-float records)
+//    and copies the rectangles out. The Dart reader uses process_comic_panels_ex.
+__attribute__((visibility("default"))) __attribute__((used))
+int process_comic_panels(
+        uint8_t* pixel_data,
+        int width,
+        int height,
+        float* out_rects,
+        int max_panels
+) {
+    constexpr int kLegacyMaxPanels = 4096;  // bounds the temporary buffer below
+    if (out_rects == nullptr || max_panels <= 0 || max_panels > kLegacyMaxPanels) {
+        LOGE("Invalid arguments passed to native core (legacy entry, max=%d).", max_panels);
+        return 0;
+    }
+    try {
+        std::vector<float> records(static_cast<size_t>(max_panels) * kRecordHeader);
+        const int count = process_comic_panels_ex(pixel_data, width, height, records.data(),
+                                                  max_panels, /*max_sub_panels=*/0,
+                                                  static_cast<int>(records.size()));
+        for (int i = 0; i < count; ++i) {
+            std::copy(records.begin() + static_cast<std::ptrdiff_t>(i) * kRecordHeader,
+                      records.begin() + static_cast<std::ptrdiff_t>(i) * kRecordHeader + 4,
+                      out_rects + i * 4);
+        }
+        return count;
+    } catch (...) {  // e.g. std::bad_alloc: never let it cross the FFI boundary
+        LOGE("Exception in legacy process_comic_panels wrapper.");
+    }
+    out_rects[0] = 0.0f;
+    out_rects[1] = 0.0f;
+    out_rects[2] = 1.0f;
+    out_rects[3] = 1.0f;
+    return 1;
 }
 
 }  // extern "C"
